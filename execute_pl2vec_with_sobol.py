@@ -66,7 +66,7 @@ for parameters in sobol_sampled_parameters.itertuples():
 
     stats_corpus_info = ut.deserializer(path=experiment_folder, serialized_name='stats_corpus_info')
 
-    P, N = parser.get_attactive_repulsive_entities(stats_corpus_info, K)
+    P, N = parser.get_attractive_repulsive_entities(stats_corpus_info, K)
     vocab_size = len(stats_corpus_info)
     del stats_corpus_info
 

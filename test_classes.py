@@ -98,5 +98,5 @@ def test_retrieve_interactting_entities():
     # PPMI of a,b = > log_2 ( joint prob of a and b/ marginal prob of a times b
     ppmi_of_entities = parser.binary_to_ppmi_matrix(co_occurrences, number_of_rdf)
 
-    P, N = parser.get_attactive_repulsive_entities(ppmi_of_entities, K)
+    P, N = parser.get_attractive_repulsive_entities(ppmi_of_entities, K)
     assert P[0] [3]==1

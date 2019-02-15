@@ -525,26 +525,9 @@ class Parser:
             assert not sampled_negative_entities in disjoint_entities
             return_val.append(set(sampled_negative_entities))
 
-            """
-                    def generate_samples(N, K):
-            return set(random.sample(range(0, N), K))
-
-        bound = 0
-        store = list()
-            temp = num_interacting_entities
-
-            while True:
-                sampled_N_entities = generate_samples(len(ppmi_co_occurence_matrix), temp)
-                if context_entities.isdisjoint(sampled_N_entities):
-                    break
-                bound += 1
-                temp -= 1
-            store.append(sampled_N_entities)
-                    return store
-            """
         return return_val
 
-    def get_attactive_repulsive_entities(self, stats_corpus_info, K):
+    def get_attractive_repulsive_entities(self, stats_corpus_info, K):
         pruned_stats_corpus_info = self.choose_to_K_attractive_entities(stats_corpus_info, K)
         context_entitiy_pms = list(pruned_stats_corpus_info.values())
         del pruned_stats_corpus_info

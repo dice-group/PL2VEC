@@ -34,7 +34,7 @@ analyser = DataAnalyser(p_folder=storage_path, execute_DL_Learner=dl_learner_pat
 
 stats_corpus_info = parser.construct_comatrix(kg_path, bound=500, bound_flag=True)
 
-P, N = parser.get_attactive_repulsive_entities(stats_corpus_info, K)
+P, N = parser.get_attractive_repulsive_entities(stats_corpus_info, K)
 vocab_size = len(stats_corpus_info)
 del stats_corpus_info
 
