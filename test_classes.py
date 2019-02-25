@@ -1,57 +1,5 @@
 import helper_classes
-
-
-def test_parser_create_dictionary():
-    parser = helper_classes.Parser()
-
-    # path of knowledge graphs
-    # KG must be under DBpedia folder
-    f_name = 'DBpedia'
-    # Read until bound
-    bound = 100
-    co_occurrences, m_term_to_index, num_triples, subjects_to_indexes = parser.create_dictionary(f_name, bound)
-
-    assert isinstance(co_occurrences, dict)
-    # keys of dict must be int
-    assert isinstance(list(co_occurrences.keys())[0], int)
-    # values of dictionary must contain int
-    assert isinstance(list(co_occurrences.values())[0][0], int)
-    # Mapping from raw entities to indexes of vocabulary
-    assert isinstance(m_term_to_index, list)
-    assert isinstance(num_triples, int)
-
-    # Number of subjects must be less than all entities
-    assert len(subjects_to_indexes) < len(co_occurrences)
-
-
-def test_parser_create_dictionary_text():
-    parser = helper_classes.Parser()
-
-    # path of knowledge graphs
-    # KG must be under Bio2RDF folder
-    f_name = 'Bio2RDF'
-    bound = 100
-    co_occurrences, m_term_to_index, num_triples, subjects_to_indexes = parser.create_dic_from_text(f_name, bound)
-
-    assert isinstance(co_occurrences, dict)
-    # keys of dict must be int
-    assert isinstance(list(co_occurrences.keys())[0], int)
-    # values of dictionary must contain int
-    assert isinstance(list(co_occurrences.values())[0][0], int)
-    # Mapping from raw entities to indexes of vocabulary
-    assert isinstance(m_term_to_index, dict)
-    assert isinstance(list(m_term_to_index.values())[0], int)
-    assert isinstance(num_triples, int)
-    # Number of subjects must be less than all entities
-    assert len(subjects_to_indexes) < len(co_occurrences)
-
-    ppmi_co_occurences = parser.binary_to_ppmi_matrix(co_occurrences, num_triples)
-
-    assert isinstance(ppmi_co_occurences, dict)
-
-    assert len(ppmi_co_occurences) == len(co_occurrences)
-
-    assert isinstance(list(ppmi_co_occurences.keys())[0], int)
+import numpy as np
 
 
 def test_binary_to_ppmi_matrix():
@@ -74,7 +22,7 @@ def test_binary_to_ppmi_matrix():
 
     number_of_rdf = 4
     # PPMI of a,b = > log_2 ( joint prob of a and b/ marginal prob of a times b
-    ppmi_co_occurences = parser.binary_to_ppmi_matrix(co_occurrences, number_of_rdf)
+    ppmi_co_occurences = parser.apply_ppmi_on_co_matrix(co_occurrences, number_of_rdf)
 
     print(ppmi_co_occurences)
     # Test the symetciy of co-occurences
@@ -88,15 +36,60 @@ def test_binary_to_ppmi_matrix():
     assert (ppmi_co_occurences[2])[1] == 0.41504
 
 
-def test_retrieve_interactting_entities():
-    parser=helper_classes.Parser()
-    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2, 4, 2, 4, 2], 2: [0, 1, 1, 4, 1, 4], 3: [0, 4],
-                      4: [0, 3, 1, 2, 2, 1]}
+def test_calculate_entropies():
+    parser = helper_classes.Parser()
 
-    number_of_rdf = 4
-    K=3
-    # PPMI of a,b = > log_2 ( joint prob of a and b/ marginal prob of a times b
-    ppmi_of_entities = parser.binary_to_ppmi_matrix(co_occurrences, number_of_rdf)
+    # 0 1 2
+    # 0 3 4
+    # 2 1 4
+    # 2 1 4
+    # 2 1 5
 
-    P, N = parser.get_attractive_repulsive_entities(ppmi_of_entities, K)
-    assert P[0] [3]==1
+    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2, 4, 2, 4, 2, 2, 5], 2: [0, 1, 1, 4, 1, 4, 1, 5], 3: [0, 4],
+                      4: [0, 3, 1, 2, 2, 1], 5: [2, 1]}
+    number_of_rdf = 5
+
+    entropies = parser.calculate_entropies(co_occurrences, number_of_rdf)
+
+    # Calculation of Entropy for 1
+    # N is multiplied by 2 as list_of_context_ent contains other two element of an RDF triple
+
+    p_one = len(co_occurrences[1]) / (number_of_rdf * 2)
+    e_one = - p_one * np.log2(p_one)
+    assert entropies[1] == round(e_one, 5)
+
+
+def test_frequency_to_entropy_jaccard_index():
+    parser = helper_classes.Parser()
+
+    # 0 1 2
+    # 0 3 4
+    # 2 1 4
+    # 2 1 4
+    # 2 1 5
+
+    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2, 4, 2, 4, 2, 2, 5], 2: [0, 1, 1, 4, 1, 4, 1, 5], 3: [0, 4],
+                      4: [0, 3, 1, 2, 2, 1], 5: [2, 1]}
+
+    number_of_rdf = 5
+
+    entropy_jaccard_sim = parser.apply_entropy_jaccard_on_co_matrix(co_occurrences, num_triples=number_of_rdf)
+    print(entropy_jaccard_sim)
+    # Is matrix symmetric ?
+    for event_a, v in entropy_jaccard_sim.items():
+        for event_b, sim in v.items():
+            assert sim == (entropy_jaccard_sim[event_b])[event_a]
+
+    # Sim(0,2)= (sum of entropies of 1, 4) /  ( sum of entropies of 1,2,3,4 + sum of entropies of 0,1,2,3,4,5
+
+    entropies = parser.calculate_entropies(co_occurrences, number_of_rdf)
+
+    sum_of_entropies_of_all_point_of_zero = entropies[1] + entropies[2] + entropies[3] + entropies[4]
+    sum_of_entropies_of_all_point_of_two = entropies[0]+entropies[1] + entropies[4] + entropies[5]
+    sum_of_entropies_of_overlapped_points = entropies[1] + entropies[4]
+
+    var = sum_of_entropies_of_overlapped_points / (
+                sum_of_entropies_of_all_point_of_zero + sum_of_entropies_of_all_point_of_two)
+
+    var=round(var,6)
+    assert entropy_jaccard_sim[0][2] == var

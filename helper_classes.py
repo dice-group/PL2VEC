@@ -14,9 +14,7 @@ from sklearn.preprocessing import MinMaxScaler
 import util as ut
 import os.path
 import matplotlib.pyplot as plt
-
 from numpy import linalg as LA
-
 import numpy as np
 import pandas as pd
 from scipy.spatial import distance
@@ -24,16 +22,12 @@ import subprocess
 import time
 from scipy import sparse
 from concurrent.futures import ProcessPoolExecutor
-
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Tuple, Sequence
+from typing import Dict
 
-np.seterr(invalid='ignore')
+import warnings
 
-
-# random_state = 5
-# np.random.seed(random_state)
-# random.seed(random_state)
+warnings.filterwarnings('error')
 
 
 def performance_debugger(func_name):
@@ -61,6 +55,10 @@ class Parser:
         self.path = 'uninitialized'
         self.logger = logger
         self.p_folder = p_folder
+        self.similarity_function = None
+
+    def set_similarity_function(self, f):
+        self.similarity_function = f
 
     def set_experiment_path(self, p):
         self.p_folder = p
@@ -76,7 +74,25 @@ class Parser:
         return marginal_probs
 
     @staticmethod
-    def calculate_ppmi(binary_co_matrix: Dict, marginal_probs: Dict, number_of_rdfs):
+    def calculate_entropies(binary_co_matrix: Dict, number_of_rdfs: int):
+        entropies = dict()
+        for unq_ent, list_of_context_ent in binary_co_matrix.items():
+            # N is multiplied by 2 as list_of_context_ent contains other two element of an RDF triple
+            marginal_prob = len(list_of_context_ent) / (number_of_rdfs * 2)
+
+            with np.errstate(divide='raise'):
+                try:
+                    entropy = -marginal_prob * np.log2(marginal_prob)
+                    entropies[unq_ent] = entropy
+                except FloatingPointError:
+                    print('entropy of term-', unq_ent, ': is set 0')
+                    print('P( term-', unq_ent, '- is', marginal_prob)
+                    entropies[unq_ent] = 0
+
+        return entropies
+
+    @staticmethod
+    def calculate_ppmi(binary_co_matrix: Dict, marginal_probs: Dict, number_of_rdfs) -> Dict:
         pmi_val_target_to_context_positive = dict()
 
         for unq_ent, list_of_context_ent in binary_co_matrix.items():
@@ -104,21 +120,62 @@ class Parser:
 
         return pmi_val_target_to_context_positive
 
-    def binary_to_ppmi_matrix(self, binary_co_matrix: Dict, N: int):
-        assert len(binary_co_matrix) > 0
+    @staticmethod
+    def calculate_entropy_jaccard(freq_matrix: Dict, entropies: Dict) -> Dict:
+        entropy_jaccard = {}
 
-        marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, N)
+        for target, list_of_context_ent in freq_matrix.items():
 
-        return self.calculate_ppmi(binary_co_matrix, marginal_probabilities, N)
+            entropy_jaccard.setdefault(target, dict())
+            co_occurring_points_w_target = set(list_of_context_ent)
 
-    def modifier(self, item):
-        item = item.replace('>', '')
-        item = item.replace('<', '')
-        item = item.replace(' .', '')
-        item = item.replace('"', '')
-        item = item.replace('"', '')
-        item = item.replace('\n', '')
-        return item
+            # Sum of entropies of all points occurred with target (x).
+            sum_of_entropy_points_target = sum(list(map(lambda i: entropies[i], co_occurring_points_w_target)))
+
+            for co_point in co_occurring_points_w_target:
+                co_occurring_points_w_co_point = set(freq_matrix[co_point])
+
+                overlapped_elements = co_occurring_points_w_target.intersection(co_occurring_points_w_co_point)
+
+                if len(overlapped_elements) == 0:
+                    print('No overlapping')
+                    continue
+
+                # Sum of entropies of all overlapping points
+                sum_of_entropy_overlapping_points = sum(list(map(lambda i: entropies[i], overlapped_elements)))
+
+                sum_of_entropy_points_co_point = sum(list(map(lambda i: entropies[i], co_occurring_points_w_co_point)))
+
+                sim = sum_of_entropy_overlapping_points / (
+                        sum_of_entropy_points_target + sum_of_entropy_points_co_point)
+
+                entropy_jaccard[target][co_point] = np.round(sim, 6)
+
+        assert len(freq_matrix) == len(entropy_jaccard)
+        return entropy_jaccard
+
+    def apply_ppmi_on_co_matrix(self, binary_co_matrix: Dict, num_triples: int) -> Dict:
+        marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, num_triples)
+        return self.calculate_ppmi(binary_co_matrix, marginal_probabilities, num_triples)
+
+    def apply_entropy_jaccard_on_co_matrix(self, freq_matrix: Dict, num_triples: int) -> Dict:
+        """
+        Calculate Shannon entropy weighted jaccard from freq_matrix
+                A=  Sum of entropies of overlapping elements
+                B=  Sum of entropies of all elements that occurred with x
+                C=  Sum of entropies of all elements that occurred with y
+
+       Sim(x,y) = A / (B+C)
+
+
+        :param freq_matrix: freq_matrix is mapping from a vertex or an edge to co-occurring vertices or edges.
+        :param num_triples:
+        :return: Mapping from points to a mapping containing a point and positive jaccard sim.
+        """
+
+        entropies = self.calculate_entropies(freq_matrix, num_triples)
+        entropy_jaccard = self.calculate_entropy_jaccard(freq_matrix, entropies)
+        return entropy_jaccard
 
     def create_dictionary(self, f_name, bound):
 
@@ -268,8 +325,8 @@ class Parser:
 
             ## This means that literal contained in RDF triple contains < > symbol
             """ pass"""
-            #print('WRONG FORMAT RDF found and will be ignored')
-            #print(sentence)
+            # print('WRONG FORMAT RDF found and will be ignored')
+            # print(sentence)
             raise ValueError()
 
         o = re.sub("\s+", " ", o)
@@ -360,6 +417,15 @@ class Parser:
             reader.close()
             num_of_rdf += total_sentence
 
+        writer_kb.close()
+        assert len(vocabulary) == len(binary_co_occurence_matrix)
+
+        print('Size of vocabulary', len(vocabulary))
+        print('Number of RDF triples', num_of_rdf)
+        print('Number of subjects', len(subjects_to_indexes))
+
+        # TODO to exclude those subject that also occurred as object
+        # TODO we can keep track of objects as well then disjunk them
         return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
 
     def create_dic_from_text_all(self, f_name):
@@ -464,17 +530,22 @@ class Parser:
         num_of_rdf = len(background_knowledge)
         del background_knowledge
 
+        assert len(binary_co_occurence_matrix) > 0
+
         return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
 
     @performance_debugger('KG to PPMI Matrix')
     def construct_comatrix(self, f_name, bound=10, bound_flag=False):
 
         if bound_flag:
-            binary_co_matrix, vocab, num_triples, subjects_to_indexes = self.create_dic_from_text(f_name, bound)
+            freq_matrix, vocab, num_triples, subjects_to_indexes = self.create_dic_from_text(f_name, bound)
         else:
-            binary_co_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
+            freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
 
-        ppmi_stats = self.binary_to_ppmi_matrix(binary_co_matrix, num_triples)
+        similarities = self.similarity_function(freq_matrix, num_triples)
+        #        similarities = self.apply_entropy_jaccard_on_co_matrix(freq_matrix, num_triples)
+
+        # similarities = self.apply_ppmi_on_co_matrix(freq_matrix, num_triples)
 
         ut.serializer(object_=vocab, path=self.p_folder, serialized_name='vocab')
         del vocab
@@ -489,7 +560,7 @@ class Parser:
         ut.serializer(object_=num_triples, path=self.p_folder, serialized_name='num_triples')
         del num_triples
 
-        return ppmi_stats
+        return similarities
 
     @performance_debugger('KG to PPMI Matrix')
     def process_knowledge_graph_to_construct_PPMI_co_matrix(self, f_name, bound):
@@ -522,7 +593,8 @@ class Parser:
 
             sampled_negative_entities = np.random.choice(sub_population, num_interacting_entities)
 
-            assert not sampled_negative_entities in disjoint_entities
+            assert not np.isin(sampled_negative_entities, disjoint_entities).all()
+
             return_val.append(set(sampled_negative_entities))
 
         return return_val
@@ -574,7 +646,7 @@ class PL2VEC(object):
 
     @staticmethod
     def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
-        return np.random.rand(num_vocab, embeddings_dim, ).astype(np.float64) + 1
+        return np.random.rand(num_vocab, embeddings_dim).astype(np.float64) + 1
 
     @staticmethod
     def get_qualifiy_repulsive_entitiy(distances, give_threshold):
@@ -603,41 +675,38 @@ class PL2VEC(object):
 
         return holder
 
-    def apply_hooke_s_law(self, embedding_space, target_index, context_indexes, PMS):
+    @staticmethod
+    def apply_hooke_s_law(embedding_space, target_index, context_indexes, PMS):
 
         dist = embedding_space[context_indexes] - embedding_space[target_index]
         pull = dist * PMS
         return np.sum(pull, axis=0), np.linalg.norm(dist)
 
     @staticmethod
-    def apply_coulomb_s_law_push(embedding_space, target_index, repulsive_indexes, negative_constant):
+    def apply_coulomb_s_law(embedding_space, target_index, repulsive_indexes, negative_constant):
         # calculate distance from target to repulsive entities
         dist = np.abs(embedding_space[repulsive_indexes] - embedding_space[target_index])
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
+        #        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
+        #        dist=(dist ** 2).filled(np.maxi)
 
-        total_push = np.sum((negative_constant / (dist ** 2)), axis=0)
+        with warnings.catch_warnings():
+            try:
+                r_square = (dist ** 2) + 1
+            except RuntimeWarning:
+                print(dist)
+                print('Overflow')
+                #                r_square = dist + 0.5
+                # print(r_square)
+                exit(1)
+
+        with warnings.catch_warnings():
+            try:
+                total_push = np.sum((negative_constant / (r_square)), axis=0)
+            except RuntimeWarning:
+                print(r_square)
+                exit(1)
 
         return total_push, np.linalg.norm(dist)
-
-    @staticmethod
-    def apply_coulomb_s_push(embedding_space, target_index, repulsive_indexes, negative_constant):
-        # calculate distance from target to repulsive entities
-        dist = embedding_space[repulsive_indexes] - embedding_space[target_index]
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
-
-        total_push = np.sum((negative_constant / (dist ** 2)), axis=0)
-
-        return total_push, np.linalg.norm(dist)
-
-    @staticmethod
-    def apply_coulomb_s_pull(embedding_space, target_index, attractive_indexes, PMS):
-        # calculate distance from target to repulsive entities
-        dist = embedding_space[attractive_indexes] - embedding_space[target_index]
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
-
-        total_pull = np.sum((PMS / (dist ** 2)), axis=0)
-
-        return total_pull, np.linalg.norm(dist)
 
     def go_through_entities(self, e, holder, negative_constant, system_energy):
 
@@ -649,7 +718,7 @@ class PL2VEC(object):
 
             pull, abs_att_dost = self.apply_hooke_s_law(e, target_index, indexes_of_attractive, pms_of_contest)
 
-            push, abs_rep_dist = self.apply_coulomb_s_push(e, target_index, indexes_of_repulsive, negative_constant)
+            push, abs_rep_dist = self.apply_coulomb_s_law(e, target_index, indexes_of_repulsive, negative_constant)
             """
             futures.append(self.texec.submit(self.apply_hooke_s_law, e, target_index, indexes_of_attractive, pms_of_contest))
             futures.append(self.texec.submit(self.apply_coulomb_s_law, e, target_index, indexes_of_repulsive, negative_constant))
@@ -669,7 +738,7 @@ class PL2VEC(object):
 
     @performance_debugger('Generating Embeddings:')
     def start(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
-        scaler = StandardScaler()
+        scaler = MinMaxScaler()
 
         for epoch in range(max_iteration):
             print('EPOCH: ', epoch)
@@ -681,7 +750,12 @@ class PL2VEC(object):
             self.system_energy = self.system_energy - energy_release_at_epoch
             self.ratio.append(d_ratio)
 
-            e = scaler.fit_transform(e)
+            # e[np.isnan(np.inf)] = e.max()
+
+            # Z-score
+            e = (e - e.mean()) / e.std()
+
+            #            e = scaler.fit_transform(e)
 
             new_f_norm = LA.norm(e, 'fro')
 
@@ -706,28 +780,11 @@ class PL2VEC(object):
             return True
         return False
 
-    """
-    def calculate_distances(self, e, holder):
-
-        current_total_distance_from_repulsives = 0
-        current_total_distance_from_attractives = 0
-        for index, T in enumerate(holder):
-            index_of_attractive_entitites, _, index_of_repulsive_entitites = T
-
-            current_total_distance_from_attractives += np.linalg.norm(e[index_of_attractive_entitites] - e[index])
-
-            current_total_distance_from_repulsives += np.linalg.norm(e[index_of_repulsive_entitites] - e[index])
-
-        self.total_distance_from_attractives.append(current_total_distance_from_attractives)
-
-        self.total_distance_from_repulsives.append(current_total_distance_from_repulsives)
-
-    """
-
     def plot_distance_function(self, title, K, NC, delta_e, path=''):
 
         X = np.array(self.total_distance_from_attractives)
         y = np.array(self.total_distance_from_repulsives)
+        print(X)
         plt.plot(X / y, linewidth=4)
 
         plt.title('Ratio of attractive and repulsive distances on ' + title)
@@ -804,7 +861,6 @@ class DataAnalyser(object):
 
     def generated_responds(self, folder_path):
         data = self.collect_configs(folder_path)
-
 
         assert os.path.isfile(self.execute_DL_Learner)
 
@@ -1151,7 +1207,8 @@ class DataAnalyser(object):
 
         return list_of_clusters
 
-    def calculate_euclidean_distance(self, *, embeddings, entitiy_to_P_URI, entitiy_to_N_URI):
+    @staticmethod
+    def calculate_euclidean_distance(*, embeddings, entitiy_to_P_URI, entitiy_to_N_URI):
         """
         Calculate the difference
         Target entitiy
@@ -1209,9 +1266,9 @@ class DataAnalyser(object):
         return df
 
     @performance_debugger('Prune non resources')
-    def prune_non_subject_entities(self, embeddings,upper_folder='not init'):
+    def prune_non_subject_entities(self, embeddings, upper_folder='not init'):
 
-        if upper_folder !='not init':
+        if upper_folder != 'not init':
             index_of_resources = ut.deserializer(path=upper_folder, serialized_name="index_of_resources")
         else:
             index_of_resources = ut.deserializer(path=self.p_folder, serialized_name="index_of_resources")
@@ -1258,7 +1315,7 @@ class DataAnalyser(object):
     def pipeline_of_data_processing(self, path, E, num_sample_from_clusters):
 
         # prune predicates and literalse
-        embeddings_of_resources = self.prune_non_subject_entities(embeddings=E,upper_folder=path)
+        embeddings_of_resources = self.prune_non_subject_entities(embeddings=E, upper_folder=path)
 
         # Partition total embeddings into number of 10
         # E = self.apply_partitioning(embeddings_of_resources, partitions=20, samp_part=10)
@@ -1543,31 +1600,15 @@ class DataAnalyser(object):
     @performance_debugger('DL-Learner')
     def pipeline_of_dl_learner(self, path, dict_of_cluster_with_original_term_names):
 
-        # vocab.p is mapping from string to pos
-        str_subjects = list(pickle.load(open(path + "/subjects_to_indexes.p", "rb")).keys())
+        with open(path + "/subjects_to_indexes.p", "rb") as f:
+            str_subjects = list(pickle.load(f).keys())
+
+        f.close()
 
         for key, val in dict_of_cluster_with_original_term_names.items():
             dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
 
-        """
-        if not (PATH == ''):
-            pickle.dump(dict_of_cluster_with_original_term_names,
-                        open(PATH + "/dict_of_cluster_with_original_term_names.p", "wb"))
-        """
-
         self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
-
-        """
-        output_of_dl = self.execute_DL(PATH, resource_vocab,dict_of_cluster_with_original_term_names)
-
-        dl_sentences = list(map(self.converter, output_of_dl))
-
-        f_name = PATH + '/DL_output.txt'
-        with open(f_name, 'w+') as file:
-            for sentence in dl_sentences:
-                file.write(sentence + '\n')
-        file.close()
-        """
 
     @performance_debugger('DL-Learner')
     def pipeline_of_single_evaluation_dl_learner(self, dict_of_cluster_with_original_term_names):

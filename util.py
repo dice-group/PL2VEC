@@ -1,15 +1,21 @@
 import datetime
 import os
 import pickle
-import dash
-import dash_core_components as dcc
-import dash_html_components as html
 import pandas as pd
-import plotly.graph_objs as go
 
 import matplotlib.pyplot as plt
 
-def create_experiment_folder( ):
+
+def modifier(item):
+    item = item.replace('>', '')
+    item = item.replace('<', '')
+    item = item.replace(' .', '')
+    item = item.replace('"', '')
+    item = item.replace('"', '')
+    item = item.replace('\n', '')
+    return item
+
+def create_experiment_folder():
     directory = os.getcwd() + '/Experiments/'
     folder_name = str(datetime.datetime.now())
     path_of_folder = directory + folder_name  # 'Spring'+str(folder_name)
@@ -17,15 +23,27 @@ def create_experiment_folder( ):
     return path_of_folder, path_of_folder[:path_of_folder.rfind('/')]
 
 
-def serializer( *, object_: object, path: str, serialized_name: str ):
-    pickle.dump(object_, open(path + '/' + serialized_name + ".p", "wb"))
+def serializer(*, object_: object, path: str, serialized_name: str):
+    with open(path + '/' + serialized_name + ".p", "wb") as f:
+        pickle.dump(object_, f)
+    f.close()
+
+    #pickle.dump(object_, open(path + '/' + serialized_name + ".p", "wb"))
 
 
-def deserializer( *, path: str, serialized_name: str ):
-    return pickle.load(open(path + "/" + serialized_name + ".p", "rb"))
+def deserializer(*, path: str, serialized_name: str):
+    with open(path + "/" + serialized_name + ".p", "rb") as f:
+        obj_ = pickle.load(f)
+    f.close()
+    return obj_
+#    return pickle.load(open(path + "/" + serialized_name + ".p", "rb"))
 
 
-def do_scatter_plot(X, path ):
+def do_scatter_plot(X, path):
+    import dash
+    import dash_core_components as dcc
+    import dash_html_components as html
+    import plotly.graph_objs as go
     names = list(pickle.load(open(path + "/vocab.p", "rb")).keys())
 
     x = X[:, 0]
@@ -50,7 +68,7 @@ def do_scatter_plot(X, path ):
                         },
                         name=i
                     ) for i in names
-                    ],
+                ],
                 'layout': go.Layout(
                     xaxis={'title': 'X'},
                     yaxis={'title': 'Y'},
@@ -63,23 +81,31 @@ def do_scatter_plot(X, path ):
 
     app.run_server(debug=True)
 
-def visualize_2D(low_embeddings,storage_path,title='default name'):
-    d=deserializer(path=storage_path,serialized_name='subjects_to_indexes')
 
-    counter=0
+def visualize_2D(low_embeddings, storage_path, title='default name'):
+    """
+    Visiualize only first two columns
+    :param low_embeddings:
+    :param storage_path:
+    :param title:
+    :return:
+    """
+    d = deserializer(path=storage_path, serialized_name='subjects_to_indexes')
+
+    counter = 0
     for k, v in d.items():
-        counter +=1
-        if counter>10:
+        counter += 1
+        if counter > 10:
             break
         x = low_embeddings[v][1]
         y = low_embeddings[v][0]
 
         annotation = k.replace('http://example.com/', '')
         annotation = annotation.replace('http://dbpedia.org/resource/', '')
-
-        #plt.annotate(annotation, (x, y))
+        annotation = annotation.replace('Category:', '')
+        plt.annotate(annotation, (x, y))
         plt.title(title)
         plt.scatter(x, y)
-        #plt.legend()
+        # plt.legend()
 
     plt.show()
