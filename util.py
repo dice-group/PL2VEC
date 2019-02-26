@@ -5,7 +5,7 @@ import pandas as pd
 
 import matplotlib.pyplot as plt
 
-
+import numpy as np
 def modifier(item):
     item = item.replace('>', '')
     item = item.replace('<', '')
@@ -39,11 +39,18 @@ def deserializer(*, path: str, serialized_name: str):
 #    return pickle.load(open(path + "/" + serialized_name + ".p", "rb"))
 
 
+
+
+
 def do_scatter_plot(X, path):
     import dash
     import dash_core_components as dcc
     import dash_html_components as html
     import plotly.graph_objs as go
+
+
+    print(X)
+    exit(1)
     names = list(pickle.load(open(path + "/vocab.p", "rb")).keys())
 
     x = X[:, 0]
@@ -109,3 +116,17 @@ def visualize_2D(low_embeddings, storage_path, title='default name'):
         # plt.legend()
 
     plt.show()
+
+
+def calculate_similarities(context_of_component_a,context_of_component_b,entropies):
+
+    # Sum of entropies of target's domain
+    sum_of_entropy_all_context_of_component_a = entropies[context_of_component_a].sum()
+    sum_of_entropy_all_context_of_component_b = entropies[context_of_component_b].sum()
+
+    intersection=np.intersect1d(context_of_component_a, context_of_component_b)
+
+    sum_of_ent_overlappings=entropies[intersection].sum()
+
+    sim=sum_of_ent_overlappings/ (sum_of_entropy_all_context_of_component_a + sum_of_entropy_all_context_of_component_b)
+    return np.round(sim,6)

@@ -41,13 +41,10 @@ def test_calculate_entropies():
 
     # 0 1 2
     # 0 3 4
-    # 2 1 4
-    # 2 1 4
-    # 2 1 5
 
-    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2, 4, 2, 4, 2, 2, 5], 2: [0, 1, 1, 4, 1, 4, 1, 5], 3: [0, 4],
-                      4: [0, 3, 1, 2, 2, 1], 5: [2, 1]}
-    number_of_rdf = 5
+    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2], 2: [0, 1], 3: [0, 4],
+                      4: [0, 1]}
+    number_of_rdf = 2
 
     entropies = parser.calculate_entropies(co_occurrences, number_of_rdf)
 
@@ -59,19 +56,16 @@ def test_calculate_entropies():
     assert entropies[1] == round(e_one, 5)
 
 
+
 def test_frequency_to_entropy_jaccard_index():
     parser = helper_classes.Parser()
 
     # 0 1 2
     # 0 3 4
-    # 2 1 4
-    # 2 1 4
-    # 2 1 5
 
-    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2, 4, 2, 4, 2, 2, 5], 2: [0, 1, 1, 4, 1, 4, 1, 5], 3: [0, 4],
-                      4: [0, 3, 1, 2, 2, 1], 5: [2, 1]}
-
-    number_of_rdf = 5
+    co_occurrences = {0: [1, 2, 3, 4], 1: [0, 2], 2: [0, 1], 3: [0, 4],
+                      4: [0, 3]}
+    number_of_rdf = 2
 
     entropy_jaccard_sim = parser.apply_entropy_jaccard_on_co_matrix(co_occurrences, num_triples=number_of_rdf)
     print(entropy_jaccard_sim)
@@ -85,8 +79,8 @@ def test_frequency_to_entropy_jaccard_index():
     entropies = parser.calculate_entropies(co_occurrences, number_of_rdf)
 
     sum_of_entropies_of_all_point_of_zero = entropies[1] + entropies[2] + entropies[3] + entropies[4]
-    sum_of_entropies_of_all_point_of_two = entropies[0]+entropies[1] + entropies[4] + entropies[5]
-    sum_of_entropies_of_overlapped_points = entropies[1] + entropies[4]
+    sum_of_entropies_of_all_point_of_two = entropies[0]+entropies[1]
+    sum_of_entropies_of_overlapped_points = entropies[1]
 
     var = sum_of_entropies_of_overlapped_points / (
                 sum_of_entropies_of_all_point_of_zero + sum_of_entropies_of_all_point_of_two)

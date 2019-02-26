@@ -11,12 +11,12 @@ np.random.seed(random_state)
 random.seed(random_state)
 
 # DEFINE MODEL PARAMS
-K = 5
-num_of_dims = 200
+K = 1
+num_of_dims = 50
 bound_on_iter = 15
-negative_constant = -1
+negative_constant = -5
 e_release = 0.01
-num_sample_from_clusters = 1
+num_sample_from_clusters = 2
 system_energy = 1
 
 # Define paths
@@ -31,7 +31,9 @@ storage_path, experiment_folder = ut.create_experiment_folder()
 
 parser = Parser(p_folder=storage_path)
 
+
 parser.set_similarity_function(parser.apply_entropy_jaccard_on_co_matrix)
+
 
 #parser.set_similarity_function(parser.apply_ppmi_on_co_matrix)
 
@@ -39,8 +41,9 @@ parser.set_similarity_function(parser.apply_entropy_jaccard_on_co_matrix)
 model = PL2VEC(system_energy=system_energy)
 
 analyser = DataAnalyser(p_folder=storage_path, execute_DL_Learner=dl_learner_path)
-
-stats_corpus_info = parser.construct_comatrix(kg_path, bound=1000, bound_flag=True)
+# TODO test construcing comatrix without bound
+# TODO If bound not given then construct without boud
+stats_corpus_info = parser.construct_comatrix(kg_path, bound=1000000, bound_flag=True)
 
 P, N = parser.get_attractive_repulsive_entities(stats_corpus_info, K)
 vocab_size = len(stats_corpus_info)
@@ -65,6 +68,7 @@ learned_embeddings = model.start(e=embeddings,
 del embeddings
 del holder
 
+
 #ut.visualize_2D(low_embeddings=learned_embeddings, storage_path=storage_path, title='Learned Embedding Space')
 
 
@@ -74,5 +78,10 @@ representative_entities = analyser.pipeline_of_data_processing_single_run(learne
 
 analyser.pipeline_of_single_evaluation_dl_learner(representative_entities)
 
+
+
 # run DL learner
 dl = analyser.generated_responds(experiment_folder)
+
+
+

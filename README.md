@@ -58,16 +58,9 @@ At a granular level, PL2VEC API consists of following components:
 
 ## Installation
 
-# Install basic dependencies
 ```
 python --version
 Python 3.6.4
 git clone https://github.com/Demirrr/physical_embedding.git
 pip install -r requirements.txt
 ```
-
-## Getting Started
-TODO
-
-## Experiments
-TODO

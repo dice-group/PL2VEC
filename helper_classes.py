@@ -74,6 +74,7 @@ class Parser:
         return marginal_probs
 
     @staticmethod
+    @performance_debugger('Calculating entropies')
     def calculate_entropies(binary_co_matrix: Dict, number_of_rdfs: int):
         entropies = dict()
         for unq_ent, list_of_context_ent in binary_co_matrix.items():
@@ -121,6 +122,7 @@ class Parser:
         return pmi_val_target_to_context_positive
 
     @staticmethod
+    @performance_debugger('Calculating entropy weighted Jaccard index')
     def calculate_entropy_jaccard(freq_matrix: Dict, entropies: Dict) -> Dict:
         entropy_jaccard = {}
 
@@ -149,9 +151,58 @@ class Parser:
                 sim = sum_of_entropy_overlapping_points / (
                         sum_of_entropy_points_target + sum_of_entropy_points_co_point)
 
+
+                exit(1)
                 entropy_jaccard[target][co_point] = np.round(sim, 6)
 
         assert len(freq_matrix) == len(entropy_jaccard)
+        return entropy_jaccard
+
+    @staticmethod
+    @performance_debugger('Calculating entropy weighted Jaccard index')
+    def efficient_calculate_entropy_jaccard(freq_matrix: Dict, entropies: Dict) -> Dict:
+        """
+
+        :param freq_matrix:
+        :param entropies: is a dictionary that maps index of point to its entropy.
+        :return:
+        """
+        assert np.all(np.array(list(entropies.keys())) == np.arange(len(entropies)))
+        # we utilize the following assumption. As entropies dictionary start from 0 to rows of freg_matrix
+        # so that we compress the required memory for entropies even further.
+        num_array_entropies = np.array(list(entropies.values()))
+        assert len(num_array_entropies) == len(freq_matrix)
+        del entropies
+
+        texec = ThreadPoolExecutor(8)
+
+        def f(l):
+            return np.unique(np.array(l))
+
+
+        # as we count each occurrences of points
+        # Contexes is a list of list from index to the indexes of co-occurred points.
+        contexts = np.array(np.array(list(map(f, list(freq_matrix.values())))))
+        entropy_jaccard = dict()
+
+        for component_a, context_of_component_a in enumerate(contexts):
+
+            #entropy_jaccard.setdefault(component_a, dict())
+
+            all_context_of_component_b = contexts[context_of_component_a]
+
+            futures = []
+            for item in all_context_of_component_b:
+                futures.append(
+                    texec.submit(ut.calculate_similarities, context_of_component_a, item, num_array_entropies))
+
+            similarities = [ff.result() for ff in futures]
+
+            d=dict(zip(context_of_component_a,similarities))
+            entropy_jaccard[component_a] = d
+
+        assert len(freq_matrix) == len(entropy_jaccard)
+
         return entropy_jaccard
 
     def apply_ppmi_on_co_matrix(self, binary_co_matrix: Dict, num_triples: int) -> Dict:
@@ -174,7 +225,11 @@ class Parser:
         """
 
         entropies = self.calculate_entropies(freq_matrix, num_triples)
-        entropy_jaccard = self.calculate_entropy_jaccard(freq_matrix, entropies)
+
+        entropy_jaccard = self.efficient_calculate_entropy_jaccard(freq_matrix, entropies)
+
+       #entropy_jaccard = self.calculate_entropy_jaccard(freq_matrix, entropies)
+
         return entropy_jaccard
 
     def create_dictionary(self, f_name, bound):
@@ -344,6 +399,8 @@ class Parser:
         binary_co_occurence_matrix = {}
         vocabulary = {}
         subjects_to_indexes = {}
+        predicates_to_indexes = {}
+
         num_of_rdf = 0
 
         p_knowledge_graphs = self.get_path_knowledge_graphs(f_name)
@@ -368,42 +425,17 @@ class Parser:
                 except ValueError:
                     continue
 
-                # processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
+                # Replace each next line character with space.
                 writer_kb.write(re.sub("\s+", " ", sentence) + '\n')
-                """
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3>', '',
-                                             1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.sider.R3>', '', 1)
-                    sentence = self.rreplace(sentence, '<http://bio2rdf.org/sider_resource:bio2rdf.dataset.sider.R4>',
-                                             '', 1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/wormbase_resource:bio2rdf.dataset.wormbase.R4>', '',
-                                             1)
-
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/pubmed_resource:bio2rdf.dataset.pubmed.R3.statistic>',
-                                             '',
-                                             1)
-
-                    s = sentence[:sentence.find('>') + 1]
-                    sentence = sentence[len(s) + 1:]
-                    p = sentence[:sentence.find('>') + 1]
-                    o = sentence[len(p) + 1:]
-
-                    s = self.modifier(s)
-                    p = self.modifier(p)
-                    o = self.modifier(o)
-                    """
 
                 # mapping from string to vocabulary
                 vocabulary.setdefault(s, len(vocabulary))
                 subjects_to_indexes[s] = vocabulary[s]
 
                 vocabulary.setdefault(p, len(vocabulary))
+                predicates_to_indexes[p] = vocabulary[p]
+
                 vocabulary.setdefault(o, len(vocabulary))
-                # subjects_to_indexes.setdefault(o, len(vocabulary) - 1)
 
                 binary_co_occurence_matrix.setdefault(vocabulary[s], []).append(vocabulary[p])
                 binary_co_occurence_matrix[vocabulary[s]].append(vocabulary[o])
@@ -423,10 +455,9 @@ class Parser:
         print('Size of vocabulary', len(vocabulary))
         print('Number of RDF triples', num_of_rdf)
         print('Number of subjects', len(subjects_to_indexes))
+        print('Number of predicates', len(predicates_to_indexes))
 
-        # TODO to exclude those subject that also occurred as object
-        # TODO we can keep track of objects as well then disjunk them
-        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
+        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes, predicates_to_indexes
 
     def create_dic_from_text_all(self, f_name):
 
@@ -538,14 +569,16 @@ class Parser:
     def construct_comatrix(self, f_name, bound=10, bound_flag=False):
 
         if bound_flag:
-            freq_matrix, vocab, num_triples, subjects_to_indexes = self.create_dic_from_text(f_name, bound)
+            freq_matrix, vocab, num_triples, subjects_to_indexes, predicates_to_indexes = self.create_dic_from_text(
+                f_name, bound)
         else:
             freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
 
         similarities = self.similarity_function(freq_matrix, num_triples)
-        #        similarities = self.apply_entropy_jaccard_on_co_matrix(freq_matrix, num_triples)
 
-        # similarities = self.apply_ppmi_on_co_matrix(freq_matrix, num_triples)
+
+        ut.serializer(object_=dict(zip(list(vocab.values()), list(vocab.keys()))), path=self.p_folder,
+                      serialized_name='i_vocab')
 
         ut.serializer(object_=vocab, path=self.p_folder, serialized_name='vocab')
         del vocab
@@ -554,12 +587,19 @@ class Parser:
         ut.serializer(object_=index_of_resources, path=self.p_folder, serialized_name='index_of_resources')
         del index_of_resources
 
+        index_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
+        ut.serializer(object_=index_of_predicates, path=self.p_folder, serialized_name='index_of_predicates')
+        del predicates_to_indexes
+        del index_of_predicates
+
         ut.serializer(object_=subjects_to_indexes, path=self.p_folder, serialized_name='subjects_to_indexes')
         del subjects_to_indexes
 
         ut.serializer(object_=num_triples, path=self.p_folder, serialized_name='num_triples')
         del num_triples
 
+        print('Exitting')
+        exit(1)
         return similarities
 
     @performance_debugger('KG to PPMI Matrix')
@@ -599,6 +639,7 @@ class Parser:
 
         return return_val
 
+    @performance_debugger('Assigning attractive and repulsive particles')
     def get_attractive_repulsive_entities(self, stats_corpus_info, K):
         pruned_stats_corpus_info = self.choose_to_K_attractive_entities(stats_corpus_info, K)
         context_entitiy_pms = list(pruned_stats_corpus_info.values())
@@ -655,6 +696,7 @@ class PL2VEC(object):
         index_of_qualifiy_entitiy = np.all(mask, axis=1)
         return distances[index_of_qualifiy_entitiy]
 
+    @performance_debugger('Compressing Information of Attractives and Repulsives')
     def combine_information(self, context_entitiy_pms, repulsitve_entities):
         assert len(context_entitiy_pms) == len(repulsitve_entities)
 
@@ -1238,7 +1280,7 @@ class DataAnalyser(object):
 
         # Saver.settings.append('Number of clusters created:' + str(len(labels)))
         # Saver.settings.append('Number of entities will be sampled from clusters:' + str(num_sample))
-
+        # str_predicates = list(ut.deserializer(path=self.p_folder, serialized_name='predicates_to_indexes').keys())
         sampled_total_entities = pd.DataFrame()
 
         def calculate_difference_to_mean(data_point):
@@ -1249,14 +1291,14 @@ class DataAnalyser(object):
             cluster = labeled_embeddings.loc[labeled_embeddings.labels == label].copy()
             mean_of_cluster = cluster.mean()
 
-            cluster['euclidiean_distance_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
+            cluster['euclidean_distance_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
             # cluster.loc[:, 'description']
-            cluster.sort_values(by=['euclidiean_distance_to_mean'], ascending=False)
+            cluster.sort_values(by=['euclidean_distance_to_mean'], ascending=False)
 
             sampled_entities_from_cluster = cluster.head(num_sample_from_clusters)
             sampled_total_entities = pd.concat([sampled_total_entities, sampled_entities_from_cluster])
 
-        sampled_total_entities.drop(['euclidiean_distance_to_mean'], axis=1, inplace=True)
+        sampled_total_entities.drop(['euclidean_distance_to_mean'], axis=1, inplace=True)
 
         return sampled_total_entities
 
@@ -1273,9 +1315,19 @@ class DataAnalyser(object):
         else:
             index_of_resources = ut.deserializer(path=self.p_folder, serialized_name="index_of_resources")
 
+        index_of_predicates = ut.deserializer(path=self.p_folder, serialized_name="index_of_predicates")
+
+        # Prune those subject that occurred in predicate position
+        index_of_only_subjects = np.setdiff1d(index_of_resources, index_of_predicates)
+
+        i_vocab = ut.deserializer(path=self.p_folder, serialized_name="i_vocab")
+
+        names = np.array(list(i_vocab.values()))[index_of_only_subjects]
+
         # PRUNE non subject entities
-        embeddings = embeddings[index_of_resources]
-        embeddings = pd.DataFrame(embeddings)
+        embeddings = embeddings[index_of_only_subjects]
+
+        embeddings = pd.DataFrame(embeddings, index=names)
 
         return embeddings
 
@@ -1322,6 +1374,9 @@ class DataAnalyser(object):
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
+        print(pseudo_labelled_embeddings)
+
+        exit(1)
         ut.serializer(object_=self.p_folder, path=path,
                       serialized_name='pseudo_labelled_resources')
 
@@ -1352,7 +1407,7 @@ class DataAnalyser(object):
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
-        ut.serializer(object_=self.p_folder, path=self.p_folder,
+        ut.serializer(object_=pseudo_labelled_embeddings, path=self.p_folder,
                       serialized_name='pseudo_labelled_resources')
 
         Saver.settings.append("### cluster distribution##")
@@ -1371,67 +1426,52 @@ class DataAnalyser(object):
 
         return representative_entities
 
+    def apply_tsne_and_plot_only_subjects(self, e):
+        import dash
+        import dash_core_components as dcc
+        import dash_html_components as html
+        import plotly.graph_objs as go
+
+        e = self.prune_non_subject_entities(e)
+
+        external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
+
+        names = list(e.index.values)
+
+        x = e.values[:, 0]
+        y = e.values[:, 1]
+
+        app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
+        app.layout = html.Div([
+            dcc.Graph(
+                id='life-exp-vs-gdp',
+                figure={
+                    'data': [
+                        go.Scatter(
+                            x=x,
+                            y=y,
+                            text=names,
+                            mode='markers',
+                            opacity=0.7,
+                            marker={
+                                'size': 15,
+                                'line': {'width': 0.5, 'color': 'white'}
+                            },
+                            name=i
+                        ) for i in names
+                    ],
+                    'layout': go.Layout(
+                        xaxis={'title': 'X'},
+                        yaxis={'title': 'Y'},
+                        hovermode='closest'
+                    )
+                }
+            )
+        ])
+
+        app.run_server(debug=True)
+
     """
-        
-        embeddings=pd.DataFrame(low_dim_embs)
-        embeddings["labels"] = ward.labels_
-        embeddings = self.sample_from_clusters(embeddings, 5)
-
-        clusters=embeddings.labels.tolist()
-
-        embeddings.drop(columns=['labels'],inplace=True)
-        embeddings=embeddings.values
-
-
-
-
-        exit(1)
-
-        tsne = TSNE(perplexity=20, n_components=2, init='pca', n_iter=2000, method='exact', random_state=10)
-
-        low_dim_embs = tsne.fit_transform(sampled_total_entities.drop(columns=['labels']))
-        names = embeddings.index.tolist()
-        clusters=embeddings.labels.tolist()
-
-        tem_labels = list()
-        for index in range(len(names)):
-            temp = names[index].replace('http://dbpedia.org/resource/', 'r:')
-            temp = temp.replace('Category', 'c:')
-
-            temp = temp.replace('http://dbpedia.org/ontology/', 'o:')
-            temp = temp.replace('\n', '')
-
-            tem_labels.append(temp)
-
-        plt.figure(figsize=(20, 20))  # in inches
-        for ith in range(len(low_dim_embs)):
-            x, y = low_dim_embs[ith]
-            plt.scatter(x, y)
-            plt.annotate(str(clusters[ith])+' '+tem_labels[ith],
-                         xy=(x, y),
-                         xytext=(5, 2),
-                         textcoords='offset points',
-                         ha='right',
-                         va='bottom')
-        plt.show()
-
-        exit(1)
-
-
-        #Sample from clusters
-        sampled_total_entities = self.sample_from_clusters(embeddings, num_sample)
-        
-
-        dicct = sampled_total_entities.labels.to_dict()
-
-        dict_of_cluster_with_original_term_names = dict()
-
-        for key, val in dicct.items():
-            dict_of_cluster_with_original_term_names.setdefault(val, []).append(key)
-
-        return dict_of_cluster_with_original_term_names, embeddings, sampled_total_entities
-        """
-
     def modifier(self, item):
         item = item.replace('>', '')
         item = item.replace('<', '')
@@ -1443,6 +1483,7 @@ class DataAnalyser(object):
         if isinstance(item, bytes):
             item = item.decode("utf-8")
         return item
+    """
 
     def create_config(self, config_path, pos_examples, sampled_neg):
 
@@ -1580,22 +1621,23 @@ class DataAnalyser(object):
 
             self.create_config(self.p_folder + '/' + str(cluster_label), uris_in_pos, sampled_negatives)
 
-    """
-        output_of_dl = list()
-        for root, dir, files in os.walk(folder_of_experiment):
+    def execute_dl(self, sampled_representatives):
 
-            for file in files:
-                if file.__contains__('.conf'):
-                    conf = root + '/' + file
+        all_samples = np.array(list(sampled_representatives.values()))
 
-                    output_of_dl.append('\n'.encode())
-                    output_of_dl.append(conf.encode())
-                    result = subprocess.run([self.execute_DL_Learner, conf], stdout=subprocess.PIPE)
-                    lines = result.stdout.splitlines()
-                    output_of_dl.extend(lines)
-                    
-        return output_of_dl
-    """
+        if len(sampled_representatives) == 1:
+            print('Only one cluster found in the embedding space')
+            print('Exitting.')
+            exit(1)
+
+        for cluster_label, val in sampled_representatives.items():
+            positive_subjects = list(val)
+
+            candidates_of_negative_subjects = np.setdiff1d(all_samples, list(positive_subjects))
+
+            sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects), replace=False)
+
+            self.create_config(self.p_folder + '/' + str(cluster_label), positive_subjects, sampled_negatives)
 
     @performance_debugger('DL-Learner')
     def pipeline_of_dl_learner(self, path, dict_of_cluster_with_original_term_names):
@@ -1618,12 +1660,13 @@ class DataAnalyser(object):
 
         str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects_to_indexes').keys())
 
-        for key, val in dict_of_cluster_with_original_term_names.items():
-            dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
+        # for key, val in dict_of_cluster_with_original_term_names.items():
+        #    dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
 
         self.kg_path = self.p_folder
 
-        self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
+        self.execute_dl(dict_of_cluster_with_original_term_names)
+        # self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
 
 
 class Saver:
