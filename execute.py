@@ -1,55 +1,84 @@
 from helper_classes import PL2VEC
 from helper_classes import Parser
 from helper_classes import DataAnalyser
+from helper_classes import Saver
+
 import util as ut
 import numpy as np
 import random
 
-## Set
+## set random number generator
 random_state = 1
 np.random.seed(random_state)
 random.seed(random_state)
 
+
+def save_all():
+    Saver.settings.append("random_state:"+str(random_state))
+    Saver.settings.append("K:"+ str(K))
+    Saver.settings.append("num_of_dims:"+ str(num_of_dims))
+    Saver.settings.append("bound_on_iter:"+ str(bound_on_iter))
+    Saver.settings.append("negative_constant:"+ str(negative_constant))
+    Saver.settings.append("e_release:"+ str(e_release))
+    Saver.settings.append("system_energy:"+ str(system_energy))
+    Saver.settings.append("num_sample_from_clusters:"+ str(num_sample_from_clusters))
+
+
 # DEFINE MODEL PARAMS
-K = 5
-num_of_dims = 50
+K = 10
+num_of_dims = 2
 bound_on_iter = 15
-negative_constant = -1
-e_release = 0.001
-num_sample_from_clusters = 4
-system_energy = 10
+negative_constant = -5
+e_release = 0.01
+num_sample_from_clusters = 3
+system_energy = 1
 
 # Define paths
-kg_root = 'KGs/DBpedia'
-kg_path = kg_root + '/skos_categories_en.ttl.bz2'
-dl_learner_path = '/home/demir/Desktop/physical_embedding/dllearner-1.3.0/bin/cli'
+
+#kg_root = 'KGs/AKSW'
+#kg_path = kg_root + '/kb.nt'
+
+#kg_root = 'KGs/DBpedia'
+#kg_path = kg_root + '/persondata_en.ttl'
+
+#kg_root = 'KGs/Bio2RDF'
+#kg_path = kg_root + '/drugbank.nq'
+
+#kg_root = 'KGs/Wikidata'
+#kg_path = kg_root + '/wikidata-simple-statements.nt'
+
+
+dl_learner_path = 'dllearner-1.3.0/bin/cli'
 
 storage_path, experiment_folder = ut.create_experiment_folder()
 
-parser = Parser(p_folder=storage_path)
+parser = Parser(p_folder=storage_path,K=K)
+
+
+parser.set_similarity_function(parser.apply_entropy_jaccard_on_co_matrix)
+#parser.set_similarity_function(parser.apply_ppmi_on_co_matrix)
+#parser.set_similarity_function(parser.apply_similarity)
 
 model = PL2VEC(system_energy=system_energy)
 
+
 analyser = DataAnalyser(p_folder=storage_path, execute_DL_Learner=dl_learner_path)
 
-stats_corpus_info = parser.construct_comatrix(kg_path, bound=500, bound_flag=True)
 
-P, N = parser.get_attactive_repulsive_entities(stats_corpus_info, K)
-vocab_size = len(stats_corpus_info)
-del stats_corpus_info
-
+P, N= parser.construct_comatrix(kg_path, bound=1000)
 ut.serializer(object_=N, path=parser.p_folder, serialized_name='Negative_URIs')
 ut.serializer(object_=P, path=parser.p_folder, serialized_name='Positive_URIs')
+
 
 holder = model.combine_information(P, N)
 del P
 del N
 
-embeddings = model.randomly_initialize_embedding_space(vocab_size, num_of_dims)
-# embeddings = model.initialize_with_svd(stats_corpus_info, num_of_dims)
-# ut.do_scatter_plot(embeddings,folder_path)
 
-ut.visualize_2D(low_embeddings=embeddings, storage_path=storage_path, title='Randomly Initialized Embedding Space')
+vocab_size=len(holder)
+
+save_all()
+embeddings = model.randomly_initialize_embedding_space(vocab_size, num_of_dims)
 
 learned_embeddings = model.start(e=embeddings,
                                  max_iteration=bound_on_iter, energy_release_at_epoch=e_release,
@@ -57,11 +86,9 @@ learned_embeddings = model.start(e=embeddings,
 del embeddings
 del holder
 
-ut.visualize_2D(low_embeddings=learned_embeddings, storage_path=storage_path, title='Learned Embedding Space')
-
 representative_entities = analyser.pipeline_of_data_processing_single_run(learned_embeddings, num_sample_from_clusters)
 
 analyser.pipeline_of_single_evaluation_dl_learner(representative_entities)
 
-# run DL learner
+#run DL learner
 dl = analyser.generated_responds(experiment_folder)
