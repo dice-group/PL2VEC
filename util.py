@@ -6,14 +6,36 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 import numpy as np
-def modifier(item):
-    item = item.replace('>', '')
-    item = item.replace('<', '')
-    item = item.replace(' .', '')
-    item = item.replace('"', '')
-    item = item.replace('"', '')
-    item = item.replace('\n', '')
-    return item
+#import sortednp as snp
+import re
+from typing import Dict
+from sklearn.decomposition import TruncatedSVD
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+def initialize_with_svd(stats_corpus_info: Dict, embeddings_dim):
+    """
+    Ini
+    :param stats_corpus_info:
+    :param embeddings_dim:
+    :return:
+    """
+    row = list()
+    col = list()
+    data = list()
+
+    num_of_unqiue_entities = len(stats_corpus_info)
+    for target_entitiy, co_info in stats_corpus_info.items():
+        row.extend([int(target_entitiy)] * len(co_info))
+        col.extend(list(co_info.keys()))
+        data.extend(list(co_info.values()))
+
+    sparse_ppmi = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+
+    svd = TruncatedSVD(n_components=embeddings_dim, n_iter=500)  # , random_state=self.random_state)
+
+    return StandardScaler().fit_transform(svd.fit_transform(sparse_ppmi))
 
 def create_experiment_folder():
     directory = os.getcwd() + '/Experiments/'
@@ -37,8 +59,6 @@ def deserializer(*, path: str, serialized_name: str):
     f.close()
     return obj_
 #    return pickle.load(open(path + "/" + serialized_name + ".p", "rb"))
-
-
 
 
 
@@ -118,15 +138,42 @@ def visualize_2D(low_embeddings, storage_path, title='default name'):
     plt.show()
 
 
-def calculate_similarities(context_of_component_a,context_of_component_b,entropies):
+def calculate_similarities(context_of_a, context_of_b, entropies):
 
-    # Sum of entropies of target's domain
-    sum_of_entropy_all_context_of_component_a = entropies[context_of_component_a].sum()
-    sum_of_entropy_all_context_of_component_b = entropies[context_of_component_b].sum()
+    intersection = snp.intersect(context_of_a, context_of_b)
 
-    intersection=np.intersect1d(context_of_component_a, context_of_component_b)
+    if len(intersection) == 0:
+        return 0
 
-    sum_of_ent_overlappings=entropies[intersection].sum()
+    sum_of_ent_context_of_a= entropies[context_of_a].sum()
 
-    sim=sum_of_ent_overlappings/ (sum_of_entropy_all_context_of_component_a + sum_of_entropy_all_context_of_component_b)
-    return np.round(sim,6)
+    sum_of_ent_context_of_b = entropies[context_of_b].sum()
+
+    sum_of_ent_intersections = entropies[intersection].sum()
+
+    sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+    return sim
+
+
+def cal_demir(context_of_a, context_of_b, entropies):
+    intersection = snp.intersect(context_of_a, context_of_b)
+
+    sum_of_ent_context_of_a = entropies[context_of_a].sum()
+
+    sum_of_ent_context_of_b = entropies[context_of_b].sum()
+
+    sum_of_ent_intersections = entropies[intersection].sum()
+
+    sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+    return sim
+
+
+
+
+def apply_pca(X):
+    pca = PCA(n_components=2)
+    low_embeddings=pca.fit_transform(X)
+
+    return low_embeddings
