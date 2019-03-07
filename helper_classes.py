@@ -1,39 +1,31 @@
-import math
 import os
 import pickle
-import random
 import re
 from bz2 import BZ2File
-from collections import Counter
+from collections import Counter, deque
 import itertools
 from scipy import spatial
 from sklearn.cluster import DBSCAN, MiniBatchKMeans
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import MinMaxScaler
 import util as ut
 import os.path
 import matplotlib.pyplot as plt
-
 from numpy import linalg as LA
-
 import numpy as np
 import pandas as pd
 from scipy.spatial import distance
 import subprocess
 import time
-from scipy import sparse
 from concurrent.futures import ProcessPoolExecutor
-
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Tuple, Sequence
+from typing import Dict, List
+from scipy import sparse
 
-np.seterr(invalid='ignore')
+import warnings
+import sortednp as snp
+from functools import reduce
 
-
-# random_state = 5
-# np.random.seed(random_state)
-# random.seed(random_state)
+warnings.filterwarnings('error')
 
 
 def performance_debugger(func_name):
@@ -57,10 +49,16 @@ def performance_debugger(func_name):
 
 
 class Parser:
-    def __init__(self, logger=False, p_folder: str = 'not initialized'):
+    def __init__(self, logger=False, p_folder: str = 'not initialized', K='not init'):
         self.path = 'uninitialized'
         self.logger = logger
         self.p_folder = p_folder
+        self.similarity_function = None
+        self.K = int(K)
+
+    def set_similarity_function(self, f):
+        self.similarity_function = f
+        Saver.settings.append('similarity_function:' + repr(f))
 
     def set_experiment_path(self, p):
         self.p_folder = p
@@ -75,17 +73,56 @@ class Parser:
             marginal_probs[unq_ent] = marginal_prob
         return marginal_probs
 
-    @staticmethod
-    def calculate_ppmi(binary_co_matrix: Dict, marginal_probs: Dict, number_of_rdfs):
-        pmi_val_target_to_context_positive = dict()
+    @performance_debugger('Calculating entropies')
+    def calculate_entropies(self, binary_co_matrix: Dict, number_of_rdfs: int):
+        """
+         Calculate shannon entropy for each vocabulary term.
 
+         ###### Parse RDF triples to co occurrence matrix  starts ######
+        Size of vocabulary 392324
+        Number of RDF triples 4215954
+        Number of subjects 316547
+        Number of predicates 95
+        ###### Calculating entropies  starts ######
+        Calculating entropies  took  4.53014206886291  seconds
+
+        :param binary_co_matrix:
+        :param number_of_rdfs:
+        :return:
+        """
+        co_occurrings = deque()
+        entropies = deque()
+        for unq_ent, list_of_context_ent in binary_co_matrix.items():
+            # N is multiplied by 2 as list_of_context_ent contains other two element of an RDF triple
+            marginal_prob = len(list_of_context_ent) / (number_of_rdfs * 2)
+
+            co_occurrings.append(np.unique(np.array(list_of_context_ent, dtype=np.uint32)))
+            # np.unique(np.array(list_of_context_ent, dtype=np.uint32)))
+            # co_occurrings.append(set(list_of_context_ent))
+
+            with np.errstate(divide='raise'):
+                try:
+                    entropy = -marginal_prob * np.log2(marginal_prob)
+                    entropies.append(entropy)
+                except FloatingPointError:
+                    print('entropy of term-', unq_ent, ': is set 0')
+                    print('P( term-', unq_ent, '- is', marginal_prob)
+                    entropies.append(0)
+
+        entropies = np.array(entropies, dtype=np.float32)
+
+        return entropies, np.array(co_occurrings)
+
+    def calculate_ppmi(self, binary_co_matrix: Dict, marginal_probs: Dict, number_of_rdfs) -> Dict:
+        top_k_sim = dict()
+        negatives = dict()
         for unq_ent, list_of_context_ent in binary_co_matrix.items():
 
             marginal_prob_of_target = marginal_probs[unq_ent]
 
             statistical_info_of_cooccurrences = Counter(list_of_context_ent)
 
-            pmi_val_target_to_context_positive.setdefault(unq_ent, dict())
+            top_k_sim.setdefault(unq_ent, dict())
 
             for context_ent, co_occuring_freq in statistical_info_of_cooccurrences.items():
 
@@ -96,115 +133,416 @@ class Parser:
                 denominator = marginal_prob_of_target * marginal_prob_of_context
 
                 if denominator > 0.00 and joint_prob > 0.0000:
-                    PMI_val = round(math.log2(joint_prob) - math.log2(denominator), 5)
+                    PMI_val = np.round(np.log2(joint_prob) - np.log2(denominator), 5)
 
-                    if PMI_val > 0.00000000:
-                        pmi_val_target_to_context_positive[unq_ent][context_ent] = PMI_val
-                        continue
+                    if len(top_k_sim[unq_ent]) <= self.K:
 
-        return pmi_val_target_to_context_positive
-
-    def binary_to_ppmi_matrix(self, binary_co_matrix: Dict, N: int):
-        assert len(binary_co_matrix) > 0
-
-        marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, N)
-
-        return self.calculate_ppmi(binary_co_matrix, marginal_probabilities, N)
-
-    def modifier(self, item):
-        item = item.replace('>', '')
-        item = item.replace('<', '')
-        item = item.replace(' .', '')
-        item = item.replace('"', '')
-        item = item.replace('"', '')
-        item = item.replace('\n', '')
-        return item
-
-    def create_dictionary(self, f_name, bound):
-
-        total_rdf_tripples = 0
-        binary_co_occurence_matrix = {}
-
-        DBpedia_files = list()
-        vocabulary = dict()
-        subjects_to_indexes = dict()
-
-        for root, dir, files in os.walk(f_name):
-            for file in files:
-                if '.bz' in file:
-                    DBpedia_files.append(f_name + '/' + file)
-
-        assert len(DBpedia_files) > 0
-
-        handle = open(root + '/' + 'KB.txt', 'w')
-
-        for f_name in DBpedia_files:
-            counter = 0
-            with BZ2File(f_name, "r") as reader:
-
-                for bytes_of_sentence in reader:
-                    sentence = bytes_of_sentence.decode('utf-8')
-
-                    components = re.findall('<(.+?)>', sentence)
-                    if len(components) == 3:
-                        s, p, o = components
-
-                    elif len(components) == 2:
-                        s, p = components
-                        __ = len(s) + len(p)
-                        # To obtain literal
-                        o = (sentence[__ + 6:-3])
+                        top_k_sim[unq_ent][context_ent] = PMI_val
                     else:
 
-                        if self.logger:
-                            print('Wrong formatted data: ', re.sub("\s+", " ", sentence), ' in', f_name)
+                        for k, v in top_k_sim[unq_ent].items():
+                            if v < PMI_val:
+                                top_k_sim[unq_ent][context_ent] = PMI_val
+                                del top_k_sim[unq_ent][k]
+                                break
 
-                        continue
-                    counter += 1
+            n = np.random.choice(len(binary_co_matrix), self.K)
 
-                    if counter == bound:
-                        break
+            negatives[unq_ent] = np.setdiff1d(n, list(list_of_context_ent))
 
-                    # Write into file to be used by DL-Learner
-                    handle.write(sentence)
-                    total_rdf_tripples += 1
+        assert len(top_k_sim) == len(negatives)
 
-                    # mapping from string to vocabulary
-                    vocabulary.setdefault(s, len(vocabulary))
-                    subjects_to_indexes.setdefault(s, len(vocabulary) - 1)
+        top_k_sim = np.array(list(top_k_sim.values()))
 
-                    vocabulary.setdefault(p, len(vocabulary))
+        return top_k_sim, negatives
 
-                    o = re.sub("\s+", " ", o)
-                    vocabulary.setdefault(o, len(vocabulary))
+    @performance_debugger('Calculating entropy weighted Jaccard index')
+    def old_calculate_2entropy_jaccard(self, freq_matrix: Dict, entropies: Dict) -> Dict:
+        entropy_jaccard = {}
 
-                    # if 'resource' in o:
-                    #    subjects_to_indexes.setdefault(o, len(vocabulary) - 1)
+        for target, list_of_context_ent in freq_matrix.items():
 
-                    binary_co_occurence_matrix.setdefault(vocabulary[s], []).append(vocabulary[p])
-                    binary_co_occurence_matrix[vocabulary[s]].append(vocabulary[o])
+            entropy_jaccard.setdefault(target, dict())
+            co_occurring_points_w_target = set(list_of_context_ent)
 
-                    binary_co_occurence_matrix.setdefault(vocabulary[p], []).append(vocabulary[s])
-                    binary_co_occurence_matrix[vocabulary[p]].append(vocabulary[o])
+            # Sum of entropies of all points occurred with target (x).
+            sum_of_entropy_points_target = sum(list(map(lambda i: entropies[i], co_occurring_points_w_target)))
 
-                    binary_co_occurence_matrix.setdefault(vocabulary[o], []).append(vocabulary[s])
-                    binary_co_occurence_matrix[vocabulary[o]].append(vocabulary[p])
+            for co_point in co_occurring_points_w_target:
+                co_occurring_points_w_co_point = set(freq_matrix[co_point])
 
-        reader.close()
+                overlapped_elements = co_occurring_points_w_target.intersection(co_occurring_points_w_co_point)
+
+                if len(overlapped_elements) == 0:
+                    print('No overlapping')
+                    continue
+
+                # Sum of entropies of all overlapping points
+                sum_of_entropy_overlapping_points = sum(list(map(lambda i: entropies[i], overlapped_elements)))
+
+                sum_of_entropy_points_co_point = sum(list(map(lambda i: entropies[i], co_occurring_points_w_co_point)))
+
+                sim = sum_of_entropy_overlapping_points / (
+                        sum_of_entropy_points_target + sum_of_entropy_points_co_point)
+
+                entropy_jaccard[target][co_point] = np.round(sim, 6)
+
+        assert len(freq_matrix) == len(entropy_jaccard)
+        return entropy_jaccard
+
+    def apply_ppmi_on_co_matrix(self, binary_co_matrix: Dict, num_triples: int) -> Dict:
+        marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, num_triples)
+        top_similarities, negatives = self.calculate_ppmi(binary_co_matrix, marginal_probabilities, num_triples)
+        return top_similarities, negatives
+
+    @performance_debugger('Jaccards of subjects')
+    def calculatted_e_j_s(self, co_occurrences, entropies, index_of_only_subjects, index_of_only_predicates):
+        top_k_sim = dict()
+        negatives = dict()
+
+        most_info = 10
+
+        for subject_a in index_of_only_subjects:
+
+            top_k_sim.setdefault(subject_a, dict())
+            negatives.setdefault(subject_a, list())
+
+            # context of subject contains any co-occurence of a subject predicate or an object
+            context_of_subject_a = co_occurrences[subject_a]
+
+            # domain of subject consists of predicates and objects
+
+            domain_of_subject_a = np.setdiff1d(context_of_subject_a, index_of_only_subjects, assume_unique=True)
+
+            #            domain_of_subject_a = snp.intersect(context_of_subject_a, index_of_only_predicates)
+
+            contextes_of_domain_of_subject_a = co_occurrences[domain_of_subject_a]
+
+            select_domain_wi = np.array([entropies[i].sum() for i in contextes_of_domain_of_subject_a])
+
+            most_informative_domain_indexes = select_domain_wi.argsort()[-most_info:][::-1]
+
+            most_informative__pre_ob_of_subject_a = domain_of_subject_a[most_informative_domain_indexes]
+
+            sum_of_ent_context_of_a = entropies[subject_a].sum()
+
+            for subject_b in most_informative__pre_ob_of_subject_a:
+
+                intersection = snp.intersect(context_of_subject_a, co_occurrences[subject_b])
+
+                sum_of_ent_context_of_b = entropies[subject_b].sum()
+
+                sum_of_ent_intersections = entropies[intersection].sum()
+
+                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+                if sim > 0:
+                    top_k_sim[subject_a][subject_b] = round(sim, 4)
+
+        return top_k_sim
+
         """
-        #        folder = f_name[:8]
-        f_name = root + '/' + 'KB.txt.txt'
-        total_rdf_tripples = len(kb)
-        with open(f_name, 'w') as handle:
-            for sentence in kb:
-                handle.write(sentence)
-        handle.close()
+        old_subject_index_to_new = dict(zip(indexes_of_subjects, np.arange(len(indexes_of_subjects))))
+
+        for a, context_of_subject_a in enumerate(domain_of_subjects):
+            top_k_sim.setdefault(a, dict())
+            negatives.setdefault(a, list())
+
+            sum_of_ent_context_of_a = entropies[context_of_subject_a].sum()
+
+            for component in context_of_subject_a:
+
+                context_of_b = co_occurrences[component]
+
+                intersection = snp.intersect(context_of_subject_a, context_of_b)
+
+                if len(intersection) < 2:
+                    continue
+
+                sum_of_ent_intersections = entropies[intersection].sum()
+
+                sum_of_ent_context_of_b = entropies[context_of_b].sum()
+
+                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+                if sim > 0 and (component in indexes_of_subjects):
+                    component = old_subject_index_to_new[component]
+                    if len(top_k_sim[a]) <= self.K:
+                        top_k_sim[a][component] = round(sim, 4)
+                    else:
+                        for k, v in top_k_sim[a].items():
+
+                            if v < sim:
+                                top_k_sim[a][component] = sim
+                                del top_k_sim[a][k]
+                                break
+                else:
+                    if len(negatives[a]) <= self.K:
+                        negatives[a].append(component)
+
+            assert len(top_k_sim) == len(negatives)
+        return top_k_sim, negatives
+    
         """
-        handle.close()
 
-        print('Number of total RDF triples ', total_rdf_tripples)
+    def apply_entropy_jaccard_subjects(self, freq_matrix: Dict, index_of_only_subjects, indexes_of_predicates,
+                                       num_triples: int):
+        """
 
-        return binary_co_occurence_matrix, list(vocabulary.keys()), total_rdf_tripples, subjects_to_indexes
+        :param index_of_only_subjects:
+        :param freq_matrix:
+        :param subjects_to_indexes:
+        :param num_triples:
+        :return:
+        """
+
+        holder = list()
+
+        entropies, co_occurrences = self.calculate_entropies(freq_matrix, num_triples)
+
+        top_k_sim = self.calculatted_e_j_s(co_occurrences, entropies, index_of_only_subjects, indexes_of_predicates)
+
+        new_index = dict(zip(list(top_k_sim.keys()), list(range(len(top_k_sim)))))
+
+        for i, index_of_sub in enumerate(index_of_only_subjects):
+            d = top_k_sim[index_of_sub]
+
+            # remove the most similar term as it is dupplicatep
+            attractives = np.array(list(d.keys()))
+
+            attractives = [new_index[i] for i in attractives]
+
+            sim = np.array(list(d.values()), dtype=np.float32).reshape(len(attractives), 1)
+
+            negatives = np.random.choice(len(index_of_only_subjects), len(attractives) * 2)
+
+            T = (attractives, sim, np.setdiff1d(negatives, attractives))
+            holder.append(T)
+
+        return holder
+
+    def apply_entropy_jaccard_on_co_matrix(self, freq_matrix: Dict, num_triples: int):
+        """
+        Calculate Shannon entropy weighted jaccard from freq_matrix
+                A=  Sum of entropies of overlapping elements
+                B=  Sum of entropies of all elements that occurred with x
+                C=  Sum of entropies of all elements that occurred with y
+
+       Sim(x,y) = A / (B+C)
+
+
+        :param subjects_to_indexes:
+        :param freq_matrix: freq_matrix is mapping from a vertex or an edge to co-occurring vertices or edges.
+        :param num_triples:
+        :return: Mapping from points to a mapping containing a point and positive jaccard sim.
+        """
+
+        entropies, co_occurrences = self.calculate_entropies(freq_matrix, num_triples)
+
+        top_k_sim, negatives = self.calculate_entropy_jaccard(entropies, co_occurrences)
+
+        return top_k_sim, negatives
+
+    @performance_debugger('Calculating entropy weighted Jaccard index')
+    def efficient_calculate_entropy_jaccard(self, entropies, contexts):
+        """
+
+        :param contexts: ith item  corresponds a numpy array whose each element corresponds with ith vocabulary term.
+        :param entropies:  ith item in entropies indicate the entropy of ith vocabulary term.
+        :return:
+
+        """
+        top_k_sim = dict()
+        negatives = dict()
+        for a, context_of_a in enumerate(contexts):
+            top_k_sim.setdefault(a, dict())
+            negatives.setdefault(a, deque())
+
+            sum_of_ent_context_of_a = sum([entropies[_] for _ in context_of_a])
+
+            for b, context_of_b in enumerate(contexts):
+
+                intersection = context_of_a.intersection(context_of_b)
+
+                sum_of_ent_intersections = sum([entropies[_] for _ in intersection])
+
+                sum_of_ent_context_of_b = sum([entropies[_] for _ in context_of_b])
+
+                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+                if sim > 0:
+
+                    if len(top_k_sim[a]) <= self.K:
+                        top_k_sim[a][b] = round(sim, 4)
+                    else:
+                        for k, v in top_k_sim[a].items():
+
+                            if v < sim:
+                                top_k_sim[a][b] = sim
+                                del top_k_sim[a][k]
+                                break
+                else:
+                    if len(negatives[a]) <= self.K:
+                        negatives[a].append(b)
+
+        return top_k_sim, negatives
+
+        """
+        texec = ThreadPoolExecutor(4)
+        holder = list()  # .append((context, sim, repulsive))
+        for a, context_of_a in enumerate(contexts):
+
+            similarities = list()
+
+            futures = []
+            for item in all_context_of_component_b:
+                futures.append(
+                    texec.submit(ut.calculate_similarities, context_of_component_a, item, num_array_entropies))
+
+            similarities = [ff.result() for ff in futures]
+
+            print(similarities)
+            exit(1)
+            index_of_top_K = (-similarity_evals_a).argsort()[:self.K]
+            top_K_similarity_val = np.around(similarity_evals_a[index_of_top_K], 4)
+            top_K_similarity_val.shape = (top_K_similarity_val.size, 1)
+
+            possible_negatives = np.argwhere(np.isnan(similarity_evals_a)).flatten()
+
+            if len(possible_negatives) == 0:
+
+                repulsives = np.array([np.argmin(similarity_evals_a)])
+
+            #            N.append(np.argwhere(np.min(similarity_evals_a))[0])
+            elif len(possible_negatives) <= self.K:
+                repulsives = possible_negatives
+            else:
+                repulsives = np.random.choice(possible_negatives, self.K, replace=False)
+
+            holder.append((index_of_top_K, top_K_similarity_val, repulsives))
+        return holder
+        """
+        """
+        for context_of_a in contexts:
+            p_sim_evals_a = deque()
+
+            for context_of_b in contexts:
+                # 2 times more time efficient then setdiff1d of numpy
+                # 1.5 times more time efficient then intersect1d of numpy
+                #intersection = snp.intersect(context_of_a, context_of_b)
+
+                intersection = context_of_a.intersection(context_of_b)
+
+                print(intersection)
+                exit(1)
+                #sum_of_ent_context_of_a = entropies[context_of_a].sum()
+
+                #sum_of_ent_context_of_b = entropies[context_of_b].sum()
+
+                #sum_of_ent_intersections = entropies[intersection].sum()
+
+                #sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+
+                #p_sim_evals_a.append(sim)
+
+            #jaccard.append(p_sim_evals_a)
+
+        """
+
+    def calculate_entropy_jaccard(self, entroies, domain):
+
+        top_k_sim = dict()
+        negatives = dict()
+
+
+        for i, domain_i in enumerate(domain):
+            top_k_sim.setdefault(i, dict())
+            negatives.setdefault(i, list())
+
+            sum_ent_domain_i = entroies[domain_i].sum()
+
+            for j in domain_i:
+
+                domain_j = domain[j]
+
+                intersection = snp.intersect(domain_i, domain_j)
+
+                if len(intersection) > 1:
+                    if len(top_k_sim[i]) <= self.K:
+
+                        sum_ent_domain_j = entroies[domain_j].sum()
+                        sim = entroies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
+                        top_k_sim[i][j] = sim
+                    else:
+                        for k, v in top_k_sim[i].items():
+                            sim = entroies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
+
+                            if v < sim:
+                                top_k_sim[i][j] = np.around(sim, 6)
+                                del top_k_sim[i][k]
+                                break
+                else:
+                    if len(negatives[i]) <= self.K:
+                        negatives[i].append(j)
+
+        assert len(top_k_sim) == len(negatives)
+
+        top_k_sim = np.array(list(top_k_sim.values()))
+        return top_k_sim, negatives
+
+    def apply_similarity(self, freq_matrix, num_triples):
+
+        entropies, co_occurence = self.calculate_entropies(freq_matrix, num_triples)
+
+        row = list()
+        col = list()
+        data = list()
+
+        num_of_unqiue_entities = len(freq_matrix)
+        for target_entitiy, co_info in freq_matrix.items():
+            l = dict(Counter(co_info))
+
+            row.extend(np.array([target_entitiy] * len(l), dtype=np.uint32))
+            col.extend(np.array(list(l.keys()), dtype=np.uint32))
+
+            data.extend(entropies[list(l.values())])
+
+        sparse_m = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+
+        get_to_K = 10
+        top_k_sim = dict()
+        negatives = dict()
+
+        for i in range(len(entropies)):
+            top_k_sim.setdefault(i, dict())
+            negatives.setdefault(i, list())
+
+            subjects_to_be_compared = sparse_m[i].dot(sparse_m).data.argsort()[-get_to_K:][::-1]
+
+            sum_ent_domain_i = entropies[i].sum()
+
+            for j in subjects_to_be_compared:
+                sum_ent_domain_j = entropies[j].sum()
+                intersection = snp.intersect(co_occurence[i], co_occurence[j])
+
+                if len(intersection) > 0:
+                    if len(top_k_sim[i]) <= self.K:
+                        sum_ent_domain_j = entropies[co_occurence[j]].sum()
+                        sim = entropies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
+                        top_k_sim[i][j] = sim
+                    else:
+                        for k, v in top_k_sim[i].items():
+                            sim = entropies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
+
+                            if v < sim:
+                                top_k_sim[i][j] = np.around(sim, 6)
+                                del top_k_sim[i][k]
+                                break
+            negatives[i] = np.random.choice(len(entropies), self.K, replace=False)
+
+        top_k_sim = np.array(list(top_k_sim.values()))
+
+        return top_k_sim, negatives
 
     def get_path_knowledge_graphs(self, path: str):
         """
@@ -219,7 +557,8 @@ class Parser:
         else:
             for root, dir, files in os.walk(path):
                 for file in files:
-                    if '.nq' in file or '.nt' in file:
+                    print(file)
+                    if '.nq' in file or '.nt' in file or 'ttl' in file:
                         KGs.append(path + '/' + file)
         if len(KGs) == 0:
             print(path + ' is not a path for a file or a folder containing any .nq or .nt formatted files')
@@ -240,7 +579,7 @@ class Parser:
 
     def decompose_rdf(self, sentence):
 
-        # TODO include literals later
+        flag=0
         # if self.is_literal_in_rdf(sentence):
 
         # return matching patter
@@ -252,11 +591,23 @@ class Parser:
             remaining_sentence = sentence[sentence.index(p) + len(p) + 2:]
             literal = remaining_sentence[:-1]
             o = literal
+            flag=2
+
         elif len(components) == 4:
             del components[-1]
             s, p, o = components
+
+            flag=4
+
         elif len(components) == 3:
             s, p, o = components
+            flag = 3
+
+            if '"' in sentence:
+                remaining=sentence[len(s)+len(p)+5:]
+                literal=remaining[1:remaining.index(' <http://')]
+                o=literal
+
         elif len(components) > 4:
 
             s = components[0]
@@ -264,18 +615,25 @@ class Parser:
             remaining_sentence = sentence[sentence.index(p) + len(p) + 2:]
             literal = remaining_sentence[:remaining_sentence.index(' <http://')]
             o = literal
+
         else:
 
             ## This means that literal contained in RDF triple contains < > symbol
             """ pass"""
-            #print('WRONG FORMAT RDF found and will be ignored')
-            #print(sentence)
+            flag=0
+            # print(sentence)
             raise ValueError()
 
-        o = re.sub("\s+", " ", o)
 
-        return s, p, o
+        #o = re.sub("\s+", "", o)
 
+        #s = re.sub("\s+", "", s)
+
+        #p = re.sub("\s+", "", p)
+
+        return s, p, o,flag
+
+    @performance_debugger('Parse RDF triples to co occurrence matrix')
     def create_dic_from_text(self, f_name: str, bound: int):
         """
 
@@ -287,12 +645,18 @@ class Parser:
         binary_co_occurence_matrix = {}
         vocabulary = {}
         subjects_to_indexes = {}
+        predicates_to_indexes = {}
+
         num_of_rdf = 0
 
         p_knowledge_graphs = self.get_path_knowledge_graphs(f_name)
+
+
         writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
 
         for f_name in p_knowledge_graphs:
+
+
             if f_name[-4:] == '.bz2':
                 reader = BZ2File(f_name, "r")
             else:
@@ -302,51 +666,49 @@ class Parser:
 
             for sentence in reader:
                 if isinstance(sentence, bytes):
-                    sentence = sentence.decode('utf-8')
+#                    sentence = sentence.decode('utf-8')
+                    sentence = sentence.decode('ascii')
+
                 if total_sentence == bound: break
 
-                total_sentence += 1
+                #             if ('rdf-schema#' in sentence) or ('description' in sentence):
+  #                  pass
+ #               else:
+#                    continue
+
+#                if '"' in sentence:
+ #                   continue
+
+
+
                 try:
-                    s, p, o = self.decompose_rdf(sentence)
+                    s, p, o,flag= self.decompose_rdf(sentence)
+
+                    if not ( (flag == 4) or (flag==3)or (flag==2)):
+                        print(sentence)
+                    #    print('exitting')
+                    #   continue
+
                 except ValueError:
                     continue
 
-                # processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
-                writer_kb.write(re.sub("\s+", " ", sentence) + '\n')
-                """
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3>', '',
-                                             1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.sider.R3>', '', 1)
-                    sentence = self.rreplace(sentence, '<http://bio2rdf.org/sider_resource:bio2rdf.dataset.sider.R4>',
-                                             '', 1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/wormbase_resource:bio2rdf.dataset.wormbase.R4>', '',
-                                             1)
+                total_sentence += 1
 
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/pubmed_resource:bio2rdf.dataset.pubmed.R3.statistic>',
-                                             '',
-                                             1)
+#                processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
+ #               writer_kb.write(processed_triples)
+                writer_kb.write(sentence)
+                # Replace each next line character with space.
+                #writer_kb.write(re.sub("<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3> .", ".", sentence))
 
-                    s = sentence[:sentence.find('>') + 1]
-                    sentence = sentence[len(s) + 1:]
-                    p = sentence[:sentence.find('>') + 1]
-                    o = sentence[len(p) + 1:]
-
-                    s = self.modifier(s)
-                    p = self.modifier(p)
-                    o = self.modifier(o)
-                    """
 
                 # mapping from string to vocabulary
                 vocabulary.setdefault(s, len(vocabulary))
                 subjects_to_indexes[s] = vocabulary[s]
 
                 vocabulary.setdefault(p, len(vocabulary))
+                predicates_to_indexes[p] = vocabulary[p]
+
                 vocabulary.setdefault(o, len(vocabulary))
-                # subjects_to_indexes.setdefault(o, len(vocabulary) - 1)
 
                 binary_co_occurence_matrix.setdefault(vocabulary[s], []).append(vocabulary[p])
                 binary_co_occurence_matrix[vocabulary[s]].append(vocabulary[o])
@@ -360,7 +722,10 @@ class Parser:
             reader.close()
             num_of_rdf += total_sentence
 
-        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
+        writer_kb.close()
+        assert len(vocabulary) == len(binary_co_occurence_matrix)
+
+        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes, predicates_to_indexes
 
     def create_dic_from_text_all(self, f_name):
 
@@ -464,20 +829,106 @@ class Parser:
         num_of_rdf = len(background_knowledge)
         del background_knowledge
 
+        assert len(binary_co_occurence_matrix) > 0
+
         return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
 
     @performance_debugger('KG to PPMI Matrix')
-    def construct_comatrix(self, f_name, bound=10, bound_flag=False):
+    def construct_comatrix(self, f_name, bound=''):
 
-        if bound_flag:
-            binary_co_matrix, vocab, num_triples, subjects_to_indexes = self.create_dic_from_text(f_name, bound)
+        if isinstance(bound, int):
+            freq_matrix, vocab, num_triples, subjects_to_indexes, predicates_to_indexes = self.create_dic_from_text(
+                f_name, bound)
         else:
-            binary_co_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
+            freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
 
-        ppmi_stats = self.binary_to_ppmi_matrix(binary_co_matrix, num_triples)
+        string_vocab=np.array(list(vocab.keys()))
+        indexes_of_subjects = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
+        indexes_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
+
+        # Prune those subject that occurred in predicate position
+        indexes_of_valid_subjects = np.setdiff1d(indexes_of_subjects, indexes_of_predicates)
+        del indexes_of_subjects
+        del indexes_of_predicates
+
+        valid_subjects=string_vocab[indexes_of_valid_subjects]
+        ut.serializer(object_=valid_subjects, path=self.p_folder, serialized_name='subjects')
+
+        num_subjects=len(subjects_to_indexes)
+        del subjects_to_indexes
+
+
+        print('Number of valid subjects for DL-Learner', len(indexes_of_valid_subjects))
+        print('Size of vocabulary', len(vocab))
+        print('Number of RDF triples', num_triples)
+        print('Number of subjects', num_subjects)
+        print('Number of predicates', len(predicates_to_indexes))
+
+
+        Saver.settings.append("Size of vocabulary:" + str(len(vocab)))
+        Saver.settings.append("Number of RDF triples:" + str(num_triples))
+        Saver.settings.append("Number of subjects:" + str(num_subjects))
+        Saver.settings.append("Number of predicates:" + str(len(predicates_to_indexes)))
+        Saver.settings.append("Number of valid subjects for DL-Learner:" + str(indexes_of_valid_subjects))
+        del vocab
+
+
+        ut.serializer(object_=indexes_of_valid_subjects, path=self.p_folder, serialized_name='indexes_of_valid_subjects')
+        del indexes_of_valid_subjects
+
+
+        texec = ThreadPoolExecutor(4)
+        future = texec.submit(self.similarity_function, freq_matrix, num_triples)
+
+
+
+
+        del freq_matrix
+
+
+
+        f = future.result()
+
+        top_k_sim = f[0]
+        negatives = f[1]
+
+
+
+        return top_k_sim, negatives
+
+    @performance_debugger('KG to PPMI Matrix')
+    def construct(self, f_name, bound=''):
+
+        if isinstance(bound, int):
+            freq_matrix, vocab, num_triples, subjects_to_indexes, predicates_to_indexes = self.create_dic_from_text(
+                f_name, bound)
+        else:
+            freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
+
+        print('Size of vocabulary', len(vocab))
+        print('Number of RDF triples', num_triples)
+        print('Number of subjects', len(subjects_to_indexes))
+
+        indexes_of_subjects = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
+        indexes_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
+
+        # Prune those subject that occurred in predicate position
+        valid_subjects = np.setdiff1d(indexes_of_subjects, indexes_of_predicates)
+        print('Number of valid subjects for DL-Learner', len(valid_subjects))
+
+        texec = ThreadPoolExecutor(4)
+        future = texec.submit(self.similarity_function, freq_matrix, num_triples)
+
+        ut.serializer(object_=dict(zip(list(vocab.values()), list(vocab.keys()))), path=self.p_folder,
+                      serialized_name='i_vocab')
 
         ut.serializer(object_=vocab, path=self.p_folder, serialized_name='vocab')
         del vocab
+
+        index_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
+        ut.serializer(object_=index_of_predicates, path=self.p_folder, serialized_name='index_of_predicates')
+        del predicates_to_indexes
+        del index_of_predicates
 
         index_of_resources = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
         ut.serializer(object_=index_of_resources, path=self.p_folder, serialized_name='index_of_resources')
@@ -486,29 +937,26 @@ class Parser:
         ut.serializer(object_=subjects_to_indexes, path=self.p_folder, serialized_name='subjects_to_indexes')
         del subjects_to_indexes
 
-        ut.serializer(object_=num_triples, path=self.p_folder, serialized_name='num_triples')
-        del num_triples
+        similarities = future.result()
 
-        return ppmi_stats
+        return similarities
 
-    @performance_debugger('KG to PPMI Matrix')
-    def process_knowledge_graph_to_construct_PPMI_co_matrix(self, f_name, bound):
+    @performance_debugger('Choose K attractives')
+    def choose_to_K_attractive_entities(self, co_similarity_matrix, size_of_iteracting_entities):
+        """
 
-        binary_co_occurrences, vocab, num_triples, only_resources = self.create_dictionary(f_name, bound)
+        :param co_similarity_matrix:
+        :param size_of_iteracting_entities:
+        :return:
+        """
 
-        ppmi_stats = self.binary_to_ppmi_matrix(binary_co_occurrences, num_triples)
-
-        return ppmi_stats, vocab, num_triples, only_resources
-
-    def choose_to_K_attractive_entities(self, ppmi_co_occurence_matrix, size_of_iteracting_entities):
-        # PPMIs are sorted and disregarded some entities
-        for k, v in ppmi_co_occurence_matrix.items():
+        for k, v in co_similarity_matrix.items():
             if len(v) > size_of_iteracting_entities:
-                ppmi_co_occurence_matrix[k] = dict(
+                co_similarity_matrix[k] = dict(
                     sorted(v.items(), key=lambda kv: kv[1], reverse=True)[0:size_of_iteracting_entities])
             else:
-                ppmi_co_occurence_matrix[k] = dict(sorted(v.items(), key=lambda kv: kv[1], reverse=True))
-        return ppmi_co_occurence_matrix
+                co_similarity_matrix[k] = dict(sorted(v.items(), key=lambda kv: kv[1], reverse=True))
+        return co_similarity_matrix
 
     def random_sample_repulsive_entities(self, ppmi_co_occurence_matrix, num_interacting_entities):
 
@@ -522,36 +970,24 @@ class Parser:
 
             sampled_negative_entities = np.random.choice(sub_population, num_interacting_entities)
 
-            assert not sampled_negative_entities in disjoint_entities
+            assert not np.isin(sampled_negative_entities, disjoint_entities).all()
+
             return_val.append(set(sampled_negative_entities))
 
-            """
-                    def generate_samples(N, K):
-            return set(random.sample(range(0, N), K))
-
-        bound = 0
-        store = list()
-            temp = num_interacting_entities
-
-            while True:
-                sampled_N_entities = generate_samples(len(ppmi_co_occurence_matrix), temp)
-                if context_entities.isdisjoint(sampled_N_entities):
-                    break
-                bound += 1
-                temp -= 1
-            store.append(sampled_N_entities)
-                    return store
-            """
         return return_val
 
-    def get_attactive_repulsive_entities(self, stats_corpus_info, K):
+    @performance_debugger('Assigning attractive and repulsive particles')
+    def get_attractive_repulsive_entities(self, stats_corpus_info, K):
         pruned_stats_corpus_info = self.choose_to_K_attractive_entities(stats_corpus_info, K)
-        context_entitiy_pms = list(pruned_stats_corpus_info.values())
+        attractives = list(pruned_stats_corpus_info.values())
         del pruned_stats_corpus_info
 
-        repulsitve_entities = self.random_sample_repulsive_entities(stats_corpus_info, K)
+        repulsive_entities = self.random_sample_repulsive_entities(stats_corpus_info, K)
 
-        return context_entitiy_pms, repulsitve_entities
+        ut.serializer(object_=repulsive_entities, path=self.p_folder, serialized_name='Negative_URIs')
+        ut.serializer(object_=attractives, path=self.p_folder, serialized_name='Positive_URIs')
+
+        return attractives, repulsive_entities
 
 
 class PL2VEC(object):
@@ -565,33 +1001,11 @@ class PL2VEC(object):
         self.ratio = list()
         self.system_energy = system_energy
 
-    @staticmethod
-    def initialize_with_svd(stats_corpus_info: Dict, embeddings_dim):
-        """
-        Ini
-        :param stats_corpus_info:
-        :param embeddings_dim:
-        :return:
-        """
-        row = list()
-        col = list()
-        data = list()
 
-        num_of_unqiue_entities = len(stats_corpus_info)
-        for target_entitiy, co_info in stats_corpus_info.items():
-            row.extend([int(target_entitiy)] * len(co_info))
-            col.extend(list(co_info.keys()))
-            data.extend(list(co_info.values()))
-
-        sparse_ppmi = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
-
-        svd = TruncatedSVD(n_components=embeddings_dim, n_iter=500)  # , random_state=self.random_state)
-
-        return StandardScaler().fit_transform(svd.fit_transform(sparse_ppmi))
 
     @staticmethod
     def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
-        return np.random.rand(num_vocab, embeddings_dim, ).astype(np.float64) + 1
+        return np.random.rand(num_vocab, embeddings_dim).astype(np.float64) + 1
 
     @staticmethod
     def get_qualifiy_repulsive_entitiy(distances, give_threshold):
@@ -600,6 +1014,7 @@ class PL2VEC(object):
         index_of_qualifiy_entitiy = np.all(mask, axis=1)
         return distances[index_of_qualifiy_entitiy]
 
+    @performance_debugger('Compressing Information of Attractives and Repulsives')
     def combine_information(self, context_entitiy_pms, repulsitve_entities):
         assert len(context_entitiy_pms) == len(repulsitve_entities)
 
@@ -620,41 +1035,38 @@ class PL2VEC(object):
 
         return holder
 
-    def apply_hooke_s_law(self, embedding_space, target_index, context_indexes, PMS):
+    @staticmethod
+    def apply_hooke_s_law(embedding_space, target_index, context_indexes, PMS):
 
         dist = embedding_space[context_indexes] - embedding_space[target_index]
         pull = dist * PMS
         return np.sum(pull, axis=0), np.linalg.norm(dist)
 
     @staticmethod
-    def apply_coulomb_s_law_push(embedding_space, target_index, repulsive_indexes, negative_constant):
+    def apply_coulomb_s_law(embedding_space, target_index, repulsive_indexes, negative_constant):
         # calculate distance from target to repulsive entities
         dist = np.abs(embedding_space[repulsive_indexes] - embedding_space[target_index])
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
+        #        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
+        #        dist=(dist ** 2).filled(np.maxi)
 
-        total_push = np.sum((negative_constant / (dist ** 2)), axis=0)
+        with warnings.catch_warnings():
+            try:
+                r_square = (dist ** 2) + 1
+            except RuntimeWarning:
+                print(dist)
+                print('Overflow')
+                #                r_square = dist + 0.5
+                # print(r_square)
+                exit(1)
+
+        with warnings.catch_warnings():
+            try:
+                total_push = np.sum((negative_constant / (r_square)), axis=0)
+            except RuntimeWarning:
+                print(r_square)
+                exit(1)
 
         return total_push, np.linalg.norm(dist)
-
-    @staticmethod
-    def apply_coulomb_s_push(embedding_space, target_index, repulsive_indexes, negative_constant):
-        # calculate distance from target to repulsive entities
-        dist = embedding_space[repulsive_indexes] - embedding_space[target_index]
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
-
-        total_push = np.sum((negative_constant / (dist ** 2)), axis=0)
-
-        return total_push, np.linalg.norm(dist)
-
-    @staticmethod
-    def apply_coulomb_s_pull(embedding_space, target_index, attractive_indexes, PMS):
-        # calculate distance from target to repulsive entities
-        dist = embedding_space[attractive_indexes] - embedding_space[target_index]
-        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
-
-        total_pull = np.sum((PMS / (dist ** 2)), axis=0)
-
-        return total_pull, np.linalg.norm(dist)
 
     def go_through_entities(self, e, holder, negative_constant, system_energy):
 
@@ -666,7 +1078,7 @@ class PL2VEC(object):
 
             pull, abs_att_dost = self.apply_hooke_s_law(e, target_index, indexes_of_attractive, pms_of_contest)
 
-            push, abs_rep_dist = self.apply_coulomb_s_push(e, target_index, indexes_of_repulsive, negative_constant)
+            push, abs_rep_dist = self.apply_coulomb_s_law(e, target_index, indexes_of_repulsive, negative_constant)
             """
             futures.append(self.texec.submit(self.apply_hooke_s_law, e, target_index, indexes_of_attractive, pms_of_contest))
             futures.append(self.texec.submit(self.apply_coulomb_s_law, e, target_index, indexes_of_repulsive, negative_constant))
@@ -682,11 +1094,11 @@ class PL2VEC(object):
             agg_att_d += abs_att_dost
             agg_rep_d += abs_rep_dist
 
-        return e, agg_att_d / agg_rep_d
+        return e, 0#agg_att_d / agg_rep_d
 
     @performance_debugger('Generating Embeddings:')
     def start(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
-        scaler = StandardScaler()
+        scaler = MinMaxScaler()
 
         for epoch in range(max_iteration):
             print('EPOCH: ', epoch)
@@ -696,9 +1108,14 @@ class PL2VEC(object):
             e, d_ratio = self.go_through_entities(e, holder, negative_constant, self.system_energy)
 
             self.system_energy = self.system_energy - energy_release_at_epoch
-            self.ratio.append(d_ratio)
+            #self.ratio.append(d_ratio)
 
-            e = scaler.fit_transform(e)
+            # e[np.isnan(np.inf)] = e.max()
+
+            # Z-score
+            e = (e - e.mean()) / e.std()
+
+            #            e = scaler.fit_transform(e)
 
             new_f_norm = LA.norm(e, 'fro')
 
@@ -723,28 +1140,11 @@ class PL2VEC(object):
             return True
         return False
 
-    """
-    def calculate_distances(self, e, holder):
-
-        current_total_distance_from_repulsives = 0
-        current_total_distance_from_attractives = 0
-        for index, T in enumerate(holder):
-            index_of_attractive_entitites, _, index_of_repulsive_entitites = T
-
-            current_total_distance_from_attractives += np.linalg.norm(e[index_of_attractive_entitites] - e[index])
-
-            current_total_distance_from_repulsives += np.linalg.norm(e[index_of_repulsive_entitites] - e[index])
-
-        self.total_distance_from_attractives.append(current_total_distance_from_attractives)
-
-        self.total_distance_from_repulsives.append(current_total_distance_from_repulsives)
-
-    """
-
     def plot_distance_function(self, title, K, NC, delta_e, path=''):
 
         X = np.array(self.total_distance_from_attractives)
         y = np.array(self.total_distance_from_repulsives)
+        print(X)
         plt.plot(X / y, linewidth=4)
 
         plt.title('Ratio of attractive and repulsive distances on ' + title)
@@ -821,7 +1221,6 @@ class DataAnalyser(object):
 
     def generated_responds(self, folder_path):
         data = self.collect_configs(folder_path)
-
 
         assert os.path.isfile(self.execute_DL_Learner)
 
@@ -1145,8 +1544,8 @@ class DataAnalyser(object):
             sampled_vector = learned_embeddings[i]
             sampled_entitiy_name = vocabulary_of_entity_names[i]
 
-            Saver.similarities.append('\n Target: ' + sampled_entitiy_name)
-            # print('\n Target:', sampled_entitiy_name)
+            Saver.settings.append('\n Target: ' + sampled_entitiy_name)
+            print('\n Target:', sampled_entitiy_name)
 
             distances = list()
 
@@ -1157,18 +1556,20 @@ class DataAnalyser(object):
 
             most_similar = distances.argsort()[1:topN]
 
-            Saver.similarities.append('\n Top similars\n')
+            Saver.settings.append('\n Top similars\n')
             similars = list()
             for index, j in enumerate(most_similar):
+                print(str(index) + '. similar: ' + vocabulary_of_entity_names[j])
                 similars.append(vocabulary_of_entity_names[j])
-                Saver.similarities.append(str(index) + '. similar: ' + vocabulary_of_entity_names[j])
+                Saver.settings.append(str(index) + '. similar: ' + vocabulary_of_entity_names[j])
 
             d[sampled_entitiy_name] = similars
             list_of_clusters.append(d)
 
         return list_of_clusters
 
-    def calculate_euclidean_distance(self, *, embeddings, entitiy_to_P_URI, entitiy_to_N_URI):
+    @staticmethod
+    def calculate_euclidean_distance(*, embeddings, entitiy_to_P_URI, entitiy_to_N_URI):
         """
         Calculate the difference
         Target entitiy
@@ -1193,32 +1594,34 @@ class DataAnalyser(object):
 
     @performance_debugger('Sample from mean of clusters')
     def sample_from_clusters(self, labeled_embeddings, num_sample_from_clusters):
-
-        labels = labeled_embeddings.labels.unique().tolist()
-
-        # Saver.settings.append('Number of clusters created:' + str(len(labels)))
-        # Saver.settings.append('Number of entities will be sampled from clusters:' + str(num_sample))
-
-        sampled_total_entities = pd.DataFrame()
-
         def calculate_difference_to_mean(data_point):
             euclidiean_dist = distance.euclidean(data_point, mean_of_cluster)
             return euclidiean_dist
+
+        labels = labeled_embeddings.labels.unique().tolist()
+
+        sampled_total_entities = pd.DataFrame()
+
+
 
         for label in labels:
             cluster = labeled_embeddings.loc[labeled_embeddings.labels == label].copy()
             mean_of_cluster = cluster.mean()
 
-            cluster['euclidiean_distance_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
+            cluster['euclidean_distance_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
             # cluster.loc[:, 'description']
-            cluster.sort_values(by=['euclidiean_distance_to_mean'], ascending=False)
+            cluster.sort_values(by=['euclidean_distance_to_mean'], ascending=False)
 
             sampled_entities_from_cluster = cluster.head(num_sample_from_clusters)
             sampled_total_entities = pd.concat([sampled_total_entities, sampled_entities_from_cluster])
 
-        sampled_total_entities.drop(['euclidiean_distance_to_mean'], axis=1, inplace=True)
+        sampled_total_entities.drop(['euclidean_distance_to_mean'], axis=1, inplace=True)
 
-        return sampled_total_entities
+        representative_entities=dict()
+        for key, val in sampled_total_entities.labels.to_dict().items():
+            representative_entities.setdefault(val, []).append(key)
+
+        return representative_entities
 
     @performance_debugger('Pseudo labeling via DBSCAN')
     def pseudo_label_DBSCAN(self, df):
@@ -1226,16 +1629,32 @@ class DataAnalyser(object):
         return df
 
     @performance_debugger('Prune non resources')
-    def prune_non_subject_entities(self, embeddings,upper_folder='not init'):
+    def prune_non_subject_entities(self, embeddings, upper_folder='not init'):
 
-        if upper_folder !='not init':
-            index_of_resources = ut.deserializer(path=upper_folder, serialized_name="index_of_resources")
+        if upper_folder != 'not init':
+            index_of_only_subjects = ut.deserializer(path=upper_folder, serialized_name="indexes_of_valid_subjects")
         else:
-            index_of_resources = ut.deserializer(path=self.p_folder, serialized_name="index_of_resources")
+            index_of_only_subjects = ut.deserializer(path=self.p_folder, serialized_name="indexes_of_valid_subjects")
+
+        # index_of_predicates = ut.deserializer(path=self.p_folder, serialized_name="index_of_predicates")
+
+        # Prune those subject that occurred in predicate position
+        # index_of_only_subjects = np.setdiff1d(index_of_resources, index_of_predicates)
+
+        #i_vocab = ut.deserializer(path=self.p_folder, serialized_name="i_vocab")
+
+        #names = np.array(list(i_vocab.values()))[index_of_only_subjects]
 
         # PRUNE non subject entities
-        embeddings = embeddings[index_of_resources]
-        embeddings = pd.DataFrame(embeddings)
+        embeddings = embeddings[index_of_only_subjects]
+        del index_of_only_subjects
+
+        names=ut.deserializer(path=self.p_folder, serialized_name="subjects")
+
+
+        embeddings = pd.DataFrame(embeddings,index=names)
+        del names
+
 
         return embeddings
 
@@ -1275,13 +1694,16 @@ class DataAnalyser(object):
     def pipeline_of_data_processing(self, path, E, num_sample_from_clusters):
 
         # prune predicates and literalse
-        embeddings_of_resources = self.prune_non_subject_entities(embeddings=E,upper_folder=path)
+        embeddings_of_resources = self.prune_non_subject_entities(embeddings=E, upper_folder=path)
 
         # Partition total embeddings into number of 10
         # E = self.apply_partitioning(embeddings_of_resources, partitions=20, samp_part=10)
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
+        print(pseudo_labelled_embeddings)
+
+        exit(1)
         ut.serializer(object_=self.p_folder, path=path,
                       serialized_name='pseudo_labelled_resources')
 
@@ -1308,90 +1730,82 @@ class DataAnalyser(object):
         embeddings_of_resources = self.prune_non_subject_entities(E)
 
         # Partition total embeddings into number of 10
-        # E = self.apply_partitioning(embeddings_of_resources, partitions=20, samp_part=10)
+        #embeddings_of_resources = self.apply_partitioning(embeddings_of_resources, partitions=50, samp_part=10)
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
-        ut.serializer(object_=self.p_folder, path=self.p_folder,
+        self.topN_cosine(pseudo_labelled_embeddings, 5, 20)
+
+        ut.serializer(object_=pseudo_labelled_embeddings, path=self.p_folder,
                       serialized_name='pseudo_labelled_resources')
+
 
         Saver.settings.append("### cluster distribution##")
         Saver.settings.append(pseudo_labelled_embeddings.labels.value_counts().to_string())
-        Saver.settings.append("#####")
+        Saver.settings.append("##" * 20)
 
-        sampled_embeddings = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
+        representative_entities = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
 
-        representative_entities = dict()
 
-        for key, val in sampled_embeddings.labels.to_dict().items():
-            representative_entities.setdefault(val, []).append(key)
+        Saver.settings.append('Num of generated clusters: ' + str(len(list(representative_entities.keys()))))
 
-        Saver.settings.append(
-            'Num of generated clusters: ' + str(len(list(representative_entities.keys()))))
+        f = open(self.p_folder + '/Settings', 'w')
+
+        for text in Saver.settings:
+            f.write(text)
+            f.write('\n')
+        f.close()
+
+        print(representative_entities)
 
         return representative_entities
 
+    def apply_tsne_and_plot_only_subjects(self, e):
+        import dash
+        import dash_core_components as dcc
+        import dash_html_components as html
+        import plotly.graph_objs as go
+
+        e = self.prune_non_subject_entities(e)
+
+        external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
+
+        names = list(e.index.values)
+
+        x = e.values[:, 0]
+        y = e.values[:, 1]
+
+        app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
+        app.layout = html.Div([
+            dcc.Graph(
+                id='life-exp-vs-gdp',
+                figure={
+                    'data': [
+                        go.Scatter(
+                            x=x,
+                            y=y,
+                            text=names,
+                            mode='markers',
+                            opacity=0.7,
+                            marker={
+                                'size': 15,
+                                'line': {'width': 0.5, 'color': 'white'}
+                            },
+                            name=i
+                        ) for i in names
+                    ],
+                    'layout': go.Layout(
+                        xaxis={'title': 'X'},
+                        yaxis={'title': 'Y'},
+                        hovermode='closest'
+                    )
+                }
+            )
+        ])
+
+        app.run_server(debug=True)
+
     """
-        
-        embeddings=pd.DataFrame(low_dim_embs)
-        embeddings["labels"] = ward.labels_
-        embeddings = self.sample_from_clusters(embeddings, 5)
-
-        clusters=embeddings.labels.tolist()
-
-        embeddings.drop(columns=['labels'],inplace=True)
-        embeddings=embeddings.values
-
-
-
-
-        exit(1)
-
-        tsne = TSNE(perplexity=20, n_components=2, init='pca', n_iter=2000, method='exact', random_state=10)
-
-        low_dim_embs = tsne.fit_transform(sampled_total_entities.drop(columns=['labels']))
-        names = embeddings.index.tolist()
-        clusters=embeddings.labels.tolist()
-
-        tem_labels = list()
-        for index in range(len(names)):
-            temp = names[index].replace('http://dbpedia.org/resource/', 'r:')
-            temp = temp.replace('Category', 'c:')
-
-            temp = temp.replace('http://dbpedia.org/ontology/', 'o:')
-            temp = temp.replace('\n', '')
-
-            tem_labels.append(temp)
-
-        plt.figure(figsize=(20, 20))  # in inches
-        for ith in range(len(low_dim_embs)):
-            x, y = low_dim_embs[ith]
-            plt.scatter(x, y)
-            plt.annotate(str(clusters[ith])+' '+tem_labels[ith],
-                         xy=(x, y),
-                         xytext=(5, 2),
-                         textcoords='offset points',
-                         ha='right',
-                         va='bottom')
-        plt.show()
-
-        exit(1)
-
-
-        #Sample from clusters
-        sampled_total_entities = self.sample_from_clusters(embeddings, num_sample)
-        
-
-        dicct = sampled_total_entities.labels.to_dict()
-
-        dict_of_cluster_with_original_term_names = dict()
-
-        for key, val in dicct.items():
-            dict_of_cluster_with_original_term_names.setdefault(val, []).append(key)
-
-        return dict_of_cluster_with_original_term_names, embeddings, sampled_total_entities
-        """
-
     def modifier(self, item):
         item = item.replace('>', '')
         item = item.replace('<', '')
@@ -1403,6 +1817,7 @@ class DataAnalyser(object):
         if isinstance(item, bytes):
             item = item.decode("utf-8")
         return item
+    """
 
     def create_config(self, config_path, pos_examples, sampled_neg):
 
@@ -1540,51 +1955,36 @@ class DataAnalyser(object):
 
             self.create_config(self.p_folder + '/' + str(cluster_label), uris_in_pos, sampled_negatives)
 
-    """
-        output_of_dl = list()
-        for root, dir, files in os.walk(folder_of_experiment):
+    def execute_dl(self, sampled_representatives):
 
-            for file in files:
-                if file.__contains__('.conf'):
-                    conf = root + '/' + file
+        all_samples = np.array(list(sampled_representatives.values()))
 
-                    output_of_dl.append('\n'.encode())
-                    output_of_dl.append(conf.encode())
-                    result = subprocess.run([self.execute_DL_Learner, conf], stdout=subprocess.PIPE)
-                    lines = result.stdout.splitlines()
-                    output_of_dl.extend(lines)
-                    
-        return output_of_dl
-    """
+        if len(sampled_representatives) == 1:
+            print('Only one cluster found in the embedding space')
+            print('Exitting.')
+            exit(1)
+
+        for cluster_label, val in sampled_representatives.items():
+            positive_subjects = list(val)
+
+            candidates_of_negative_subjects = np.setdiff1d(all_samples, positive_subjects)
+
+            sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects),replace=False)
+
+            self.create_config(self.p_folder + '/' + str(cluster_label), positive_subjects, sampled_negatives)
 
     @performance_debugger('DL-Learner')
     def pipeline_of_dl_learner(self, path, dict_of_cluster_with_original_term_names):
 
-        # vocab.p is mapping from string to pos
-        str_subjects = list(pickle.load(open(path + "/subjects_to_indexes.p", "rb")).keys())
+        with open(path + "/subjects_to_indexes.p", "rb") as f:
+            str_subjects = list(pickle.load(f).keys())
+
+        f.close()
 
         for key, val in dict_of_cluster_with_original_term_names.items():
             dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
 
-        """
-        if not (PATH == ''):
-            pickle.dump(dict_of_cluster_with_original_term_names,
-                        open(PATH + "/dict_of_cluster_with_original_term_names.p", "wb"))
-        """
-
         self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
-
-        """
-        output_of_dl = self.execute_DL(PATH, resource_vocab,dict_of_cluster_with_original_term_names)
-
-        dl_sentences = list(map(self.converter, output_of_dl))
-
-        f_name = PATH + '/DL_output.txt'
-        with open(f_name, 'w+') as file:
-            for sentence in dl_sentences:
-                file.write(sentence + '\n')
-        file.close()
-        """
 
     @performance_debugger('DL-Learner')
     def pipeline_of_single_evaluation_dl_learner(self, dict_of_cluster_with_original_term_names):
@@ -1592,14 +1992,15 @@ class DataAnalyser(object):
         # vocab.p is mapping from string to pos
         # str_subjects = list(pickle.load(open(path + "/subjects_to_indexes.p", "rb")).keys())
 
-        str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects_to_indexes').keys())
+#        str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects').keys())
 
-        for key, val in dict_of_cluster_with_original_term_names.items():
-            dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
+        # for key, val in dict_of_cluster_with_original_term_names.items():
+        #    dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
 
         self.kg_path = self.p_folder
 
-        self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
+        self.execute_dl(dict_of_cluster_with_original_term_names)
+        # self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
 
 
 class Saver:
