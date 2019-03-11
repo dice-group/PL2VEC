@@ -1,8 +1,6 @@
 ### Physical Embedding Model for Knowledge Graphs ###
 
-PL2VEC is a Python API for learning a continuous vector representation of entities and relations in RDF knowledge graphs.
-PL2VEC considers each entity and relation as a particle in the embedding space. 
-Iteratively each particle is pulled and pushed by its respective attractive and repulsive particles.
+PL2VEC is an open source project for knowledge graph embedding.
 
 - [What is PL2VEC](#PL2VEC)
 - [Implementation](#Implementation)
@@ -16,9 +14,10 @@ Iteratively each particle is pulled and pushed by its respective attractive and 
 
 ## PL2VEC
 PL2VEC is a novel physical embedding model for RDF knowledge graphs. 
-It is a physical model as entities and relations are considered as particles in the embedding space.
-Each particle is iteratively pulled and pushed by its respective attractive and repulsive particles. 
-Hooke's Law and Coulomb's law are employed to quantify the attractive and repulsive forces.
+It is a physical model as its properties are inherited from disciplines:  
+Hooke's Law and Coulomb's Law from ***Physics***,
+an optimization technique inspired by Simulated Annealing and several similarity measurements pointwise mutual information and entropy weighted jaccard similarity.
+. For more information please refer to URL of paper.
 
 
 ## Implementation
@@ -35,17 +34,17 @@ At a granular level, PL2VEC API consists of following components:
 
 | Component | Description |
 | ---- | --- |
-| **Parser.construct_comatrix** | Constructs a co-occurrence matrix from RDF KG. |
-| **Parser.get_attractive_repulsive_entities** | Each entity is assigned with two lists of entities.|
+| **Parser.pipeline_of_preprocessing** | Implements the workflow of Parser. |
 
 ### PL2VEC
 
 | Component | Description |
 | ---- | --- |
-| **PL2VEC.randomly_initialize_embedding_space** | self explanatory |
-| **PL2VEC.initialize_with_SVD** | Initialize embedding space via applying Singular Value Decomposition on the constructed co-occurrence matrix. |
+| **PL2VEC.pipeline_of_learning_embeddings**| Implements the worfklow of PL2VEC. |
 | **PL2VEC.apply_hooke_s_law**   | Calculate attractive forces for a given particle. |
 | **PL2VEC.apply_coulomb_s_law** | Calculate repulsive forces for a given particle. |
+| **PL2VEC.equilibrium** | Calculate to the distance to equilibrium of the embedding space. |
+
 
 ### DataAnalyser
 
@@ -57,6 +56,12 @@ At a granular level, PL2VEC API consists of following components:
 | **DataAnalyser.perform_sampling** | Samples N particles from each cluster's mean. |
 | **DataAnalyser.execute_DL** | returns class expressions in description logic syntax and  F-scores from DL-Learner for each cluster|
 
+### Util
+
+| Component | Description |
+| ---- | --- |
+| **randomly_initialize_embedding_space** | self explanatory |
+| **initialize_with_SVD** | Initialize embedding space via applying Singular Value Decomposition on the constructed co-occurrence matrix. |
 
 ## Installation
 
@@ -68,4 +73,6 @@ pip install -r requirements.txt
 ```
 ## Interactive playground
 
+We provide an interactive playground of PL2VEC via Google Colab. Users can easly reproduce our evaluations as well as 
+observe easy usage of our framework.
 [Interactive PL2VEC](https://colab.research.google.com/drive/1Rh37e8J_FoIk1rsQdCwNoN7_1Xy-kvEQ)
