@@ -1123,7 +1123,7 @@ class Parser:
         return holder
 
     @performance_debugger('Constructing entitiy adj matrix')
-    def construct_entity_adj_matrix(self, f_name, bound=''):
+    def pipeline_of_preprocessing(self, f_name, bound=''):
         vocabulary = None
         freq_adj_matrix = None
         num_of_rdf = None
@@ -1223,38 +1223,6 @@ class PL2VEC(object):
         self.ratio = list()
         self.system_energy = system_energy
 
-    @staticmethod
-    def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
-        return np.random.rand(num_vocab, embeddings_dim).astype(np.float64) + 1
-
-    @staticmethod
-    def get_qualifiy_repulsive_entitiy(distances, give_threshold):
-        absolute_distance = np.abs(distances)
-        mask = absolute_distance < give_threshold
-        index_of_qualifiy_entitiy = np.all(mask, axis=1)
-        return distances[index_of_qualifiy_entitiy]
-
-    @performance_debugger('Compressing Information of Attractives and Repulsives')
-    def combine_information(self, context_entitiy_pms, repulsitve_entities):
-        assert len(context_entitiy_pms) == len(repulsitve_entities)
-
-        holder = list()
-        for index_of_i, top_k_index in context_entitiy_pms.items():
-
-            context = np.array(list(top_k_index.keys()), dtype=np.int32)
-
-
-            pms = np.around(list(top_k_index.values()), 3).astype(np.float32)
-            pms.shape = (pms.size, 1)
-
-            repulsive = np.array(list(repulsitve_entities[index_of_i]), dtype=np.int32)
-
-            holder.append((context, pms, repulsive))
-        del repulsitve_entities
-        # del ppmi_co_occurence_matrix
-        del context_entitiy_pms
-
-        return holder
 
     @staticmethod
     def apply_hooke_s_law(embedding_space, target_index, context_indexes, PMS):
@@ -1318,7 +1286,7 @@ class PL2VEC(object):
         return e, 0  # agg_att_d / agg_rep_d
 
     @performance_debugger('Generating Embeddings:')
-    def start(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
+    def pipeline_of_learning_embeddings(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
         scaler = MinMaxScaler()
 
         for epoch in range(max_iteration):

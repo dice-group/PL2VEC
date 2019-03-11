@@ -255,3 +255,8 @@ def decompose_rdf(self, sentence):
     #p = re.sub("\s+", "", p)
 
     return s, p, o,flag
+
+
+
+def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
+    return np.random.rand(num_vocab, embeddings_dim).astype(np.float64) + 1

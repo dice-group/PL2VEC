@@ -58,10 +58,10 @@ storage_path, experiment_folder = ut.create_experiment_folder()
 parser = Parser(p_folder=storage_path,K=K)
 
 
-#parser.set_similarity_function(parser.apply_entropy_jaccard_on_entitiy_adj_matrix)
+parser.set_similarity_function(parser.apply_entropy_jaccard_on_entitiy_adj_matrix)
 #parser.set_similarity_function(parser.apply_ppmi_on_entitiy_adj_matrix)
 #parser.set_similarity_function(parser.apply_similarity_on_laplacian)
-parser.set_similarity_function(parser.apply_entropy_jaccard_with_networkx)
+#parser.set_similarity_function(parser.apply_entropy_jaccard_with_networkx)
 
 
 model = PL2VEC(system_energy=system_energy)
@@ -71,18 +71,18 @@ analyser = DataAnalyser(p_folder=storage_path, execute_DL_Learner=dl_learner_pat
 
 
 #P, N= parser.construct_comatrix(kg_path, bound=5000)
-holder=parser.construct_entity_adj_matrix(kg_path,bound=1000)
+holder=parser.pipeline_of_preprocessing(kg_path, bound=1000)
 
 
 
 vocab_size=len(holder)
 
 save_all()
-embeddings = model.randomly_initialize_embedding_space(vocab_size, num_of_dims)
+embeddings = ut.randomly_initialize_embedding_space(vocab_size, num_of_dims)
 
-learned_embeddings = model.start(e=embeddings,
-                                 max_iteration=bound_on_iter, energy_release_at_epoch=e_release,
-                                 holder=holder, negative_constant=negative_constant)
+learned_embeddings = model.pipeline_of_learning_embeddings(e=embeddings,
+                                                           max_iteration=bound_on_iter, energy_release_at_epoch=e_release,
+                                                           holder=holder, negative_constant=negative_constant)
 del embeddings
 del holder
 

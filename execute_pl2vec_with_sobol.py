@@ -95,9 +95,9 @@ for parameters in sobol_sampled_parameters.itertuples():
 
     # ut.visualize_2D(low_embeddings=embeddings, storage_path=storage_path, title='Randomly Initialized Embedding Space')
 
-    learned_embeddings = model.start(e=embeddings,
-                                     max_iteration=bound_on_iter, energy_release_at_epoch=energy_release_at_epoch,
-                                     holder=holder, negative_constant=negative_constant)
+    learned_embeddings = model.pipeline_of_learning_embeddings(e=embeddings,
+                                                               max_iteration=bound_on_iter, energy_release_at_epoch=energy_release_at_epoch,
+                                                               holder=holder, negative_constant=negative_constant)
     del embeddings
     del holder
     # ut.visualize_2D(low_embeddings=learned_embeddings, storage_path=storage_path, title='Learned Embedding Space')
