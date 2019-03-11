@@ -2,7 +2,7 @@ import datetime
 import os
 import pickle
 import pandas as pd
-
+from scipy import sparse
 import matplotlib.pyplot as plt
 
 import numpy as np
@@ -13,6 +13,28 @@ from sklearn.decomposition import TruncatedSVD
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+
+
+def get_path_knowledge_graphs(self, path: str):
+    """
+
+    :param path: str represents path of a KB or path of folder containg KBs
+    :return:
+    """
+    KGs = list()
+
+    if os.path.isfile(path):
+        KGs.append(path)
+    else:
+        for root, dir, files in os.walk(path):
+            for file in files:
+                print(file)
+                if '.nq' in file or '.nt' in file or 'ttl' in file:
+                    KGs.append(path + '/' + file)
+    if len(KGs) == 0:
+        print(path + ' is not a path for a file or a folder containing any .nq or .nt formatted files')
+        exit(1)
+    return KGs
 
 def initialize_with_svd(stats_corpus_info: Dict, embeddings_dim):
     """
@@ -49,8 +71,6 @@ def serializer(*, object_: object, path: str, serialized_name: str):
     with open(path + '/' + serialized_name + ".p", "wb") as f:
         pickle.dump(object_, f)
     f.close()
-
-    #pickle.dump(object_, open(path + '/' + serialized_name + ".p", "wb"))
 
 
 def deserializer(*, path: str, serialized_name: str):
@@ -177,3 +197,61 @@ def apply_pca(X):
     low_embeddings=pca.fit_transform(X)
 
     return low_embeddings
+
+
+
+def decompose_rdf(self, sentence):
+
+    flag=0
+    # if self.is_literal_in_rdf(sentence):
+
+    # return matching patter
+    # return <what written here>
+    # so "kinase activity"^^ <...> ignored
+    components = re.findall('<(.+?)>', sentence)
+    if len(components) == 2:
+        s, p = components
+        remaining_sentence = sentence[sentence.index(p) + len(p) + 2:]
+        literal = remaining_sentence[:-1]
+        o = literal
+        flag=2
+
+    elif len(components) == 4:
+        del components[-1]
+        s, p, o = components
+
+        flag=4
+
+    elif len(components) == 3:
+        s, p, o = components
+        flag = 3
+
+        if '"' in sentence:
+            remaining=sentence[len(s)+len(p)+5:]
+            literal=remaining[1:remaining.index(' <http://')]
+            o=literal
+
+    elif len(components) > 4:
+
+        s = components[0]
+        p = components[1]
+        remaining_sentence = sentence[sentence.index(p) + len(p) + 2:]
+        literal = remaining_sentence[:remaining_sentence.index(' <http://')]
+        o = literal
+
+    else:
+
+        ## This means that literal contained in RDF triple contains < > symbol
+        """ pass"""
+        flag=0
+        # print(sentence)
+        raise ValueError()
+
+
+    #o = re.sub("\s+", "", o)
+
+    #s = re.sub("\s+", "", s)
+
+    #p = re.sub("\s+", "", p)
+
+    return s, p, o,flag
