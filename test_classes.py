@@ -67,7 +67,7 @@ def test_frequency_to_entropy_jaccard_index():
                       4: [0, 3]}
     number_of_rdf = 2
 
-    entropy_jaccard_sim = parser.apply_entropy_jaccard_on_co_matrix(co_occurrences, num_triples=number_of_rdf)
+    entropy_jaccard_sim = parser.apply_entropy_jaccard_on_entitiy_adj_matrix(co_occurrences, num_triples=number_of_rdf)
     print(entropy_jaccard_sim)
     # Is matrix symmetric ?
     for event_a, v in entropy_jaccard_sim.items():

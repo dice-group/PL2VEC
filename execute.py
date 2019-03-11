@@ -39,7 +39,7 @@ system_energy = 1
 #kg_path = kg_root + '/kb.nt'
 
 #kg_root = 'KGs/DBpedia'
-#kg_path = kg_root + '/persondata_en.ttl'
+#kg_path = kg_root + '/'
 
 #kg_root = 'KGs/Bio2RDF'
 #kg_path = kg_root + '/drugbank.nq'
@@ -48,6 +48,9 @@ system_energy = 1
 #kg_path = kg_root + '/wikidata-simple-statements.nt'
 
 
+kg_root = 'KGs/SWDF'
+kg_path = kg_root + '/SWDF.nt'
+
 dl_learner_path = 'dllearner-1.3.0/bin/cli'
 
 storage_path, experiment_folder = ut.create_experiment_folder()
@@ -55,9 +58,11 @@ storage_path, experiment_folder = ut.create_experiment_folder()
 parser = Parser(p_folder=storage_path,K=K)
 
 
-parser.set_similarity_function(parser.apply_entropy_jaccard_on_co_matrix)
-#parser.set_similarity_function(parser.apply_ppmi_on_co_matrix)
-#parser.set_similarity_function(parser.apply_similarity)
+#parser.set_similarity_function(parser.apply_entropy_jaccard_on_entitiy_adj_matrix)
+#parser.set_similarity_function(parser.apply_ppmi_on_entitiy_adj_matrix)
+#parser.set_similarity_function(parser.apply_similarity_on_laplacian)
+parser.set_similarity_function(parser.apply_entropy_jaccard_with_networkx)
+
 
 model = PL2VEC(system_energy=system_energy)
 
@@ -65,14 +70,9 @@ model = PL2VEC(system_energy=system_energy)
 analyser = DataAnalyser(p_folder=storage_path, execute_DL_Learner=dl_learner_path)
 
 
-P, N= parser.construct_comatrix(kg_path, bound=1000)
-ut.serializer(object_=N, path=parser.p_folder, serialized_name='Negative_URIs')
-ut.serializer(object_=P, path=parser.p_folder, serialized_name='Positive_URIs')
+#P, N= parser.construct_comatrix(kg_path, bound=5000)
+holder=parser.construct_entity_adj_matrix(kg_path,bound=1000)
 
-
-holder = model.combine_information(P, N)
-del P
-del N
 
 
 vocab_size=len(holder)

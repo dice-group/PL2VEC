@@ -10,6 +10,8 @@ Iteratively each particle is pulled and pushed by its respective attractive and 
     - [PL2VEC](#PL2VEC)
     - [Data Analyser](#data-analyser)
 - [Installation](#installation)
+- [Interactive playground](#playground)
+
 
 
 ## PL2VEC
@@ -64,3 +66,6 @@ Python 3.6.4
 git clone https://github.com/Demirrr/physical_embedding.git
 pip install -r requirements.txt
 ```
+## Interactive playground
+
+[Interactive PL2VEC](https://colab.research.google.com/drive/1Rh37e8J_FoIk1rsQdCwNoN7_1Xy-kvEQ)

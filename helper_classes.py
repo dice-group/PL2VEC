@@ -1,6 +1,7 @@
 import os
 import pickle
 import re
+import math
 from bz2 import BZ2File
 from collections import Counter, deque
 import itertools
@@ -18,14 +19,18 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict
+
+from typing import Tuple
+import typing
 from scipy import sparse
+import sys
 
 import warnings
 import sortednp as snp
-from functools import reduce
+from scipy.sparse.csgraph import connected_components
 
-warnings.filterwarnings('error')
+#warnings.filterwarnings('error')
 
 
 def performance_debugger(func_name):
@@ -74,31 +79,26 @@ class Parser:
         return marginal_probs
 
     @performance_debugger('Calculating entropies')
-    def calculate_entropies(self, binary_co_matrix: Dict, number_of_rdfs: int):
+    def calculate_entropies(self, freq_adj_matrix: Dict, number_of_rdfs: int) -> typing.Tuple[np.array,np.array]:
         """
          Calculate shannon entropy for each vocabulary term.
 
          ###### Parse RDF triples to co occurrence matrix  starts ######
-        Size of vocabulary 392324
-        Number of RDF triples 4215954
-        Number of subjects 316547
-        Number of predicates 95
-        ###### Calculating entropies  starts ######
-        Calculating entropies  took  4.53014206886291  seconds
-
-        :param binary_co_matrix:
+        :param freq_adj_matrix:
         :param number_of_rdfs:
         :return:
         """
+
         co_occurrings = deque()
         entropies = deque()
-        for unq_ent, list_of_context_ent in binary_co_matrix.items():
-            # N is multiplied by 2 as list_of_context_ent contains other two element of an RDF triple
-            marginal_prob = len(list_of_context_ent) / (number_of_rdfs * 2)
 
-            co_occurrings.append(np.unique(np.array(list_of_context_ent, dtype=np.uint32)))
-            # np.unique(np.array(list_of_context_ent, dtype=np.uint32)))
-            # co_occurrings.append(set(list_of_context_ent))
+        for unq_ent, contexts_w_co_freq in freq_adj_matrix.items():
+
+
+            marginal_prob = sum(contexts_w_co_freq.values()) / number_of_rdfs
+
+
+            co_occurrings.append(np.array(list(contexts_w_co_freq.keys()),dtype=np.uint32))
 
             with np.errstate(divide='raise'):
                 try:
@@ -155,40 +155,6 @@ class Parser:
         top_k_sim = np.array(list(top_k_sim.values()))
 
         return top_k_sim, negatives
-
-    @performance_debugger('Calculating entropy weighted Jaccard index')
-    def old_calculate_2entropy_jaccard(self, freq_matrix: Dict, entropies: Dict) -> Dict:
-        entropy_jaccard = {}
-
-        for target, list_of_context_ent in freq_matrix.items():
-
-            entropy_jaccard.setdefault(target, dict())
-            co_occurring_points_w_target = set(list_of_context_ent)
-
-            # Sum of entropies of all points occurred with target (x).
-            sum_of_entropy_points_target = sum(list(map(lambda i: entropies[i], co_occurring_points_w_target)))
-
-            for co_point in co_occurring_points_w_target:
-                co_occurring_points_w_co_point = set(freq_matrix[co_point])
-
-                overlapped_elements = co_occurring_points_w_target.intersection(co_occurring_points_w_co_point)
-
-                if len(overlapped_elements) == 0:
-                    print('No overlapping')
-                    continue
-
-                # Sum of entropies of all overlapping points
-                sum_of_entropy_overlapping_points = sum(list(map(lambda i: entropies[i], overlapped_elements)))
-
-                sum_of_entropy_points_co_point = sum(list(map(lambda i: entropies[i], co_occurring_points_w_co_point)))
-
-                sim = sum_of_entropy_overlapping_points / (
-                        sum_of_entropy_points_target + sum_of_entropy_points_co_point)
-
-                entropy_jaccard[target][co_point] = np.round(sim, 6)
-
-        assert len(freq_matrix) == len(entropy_jaccard)
-        return entropy_jaccard
 
     def apply_ppmi_on_co_matrix(self, binary_co_matrix: Dict, num_triples: int) -> Dict:
         marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, num_triples)
@@ -321,7 +287,7 @@ class Parser:
 
         return holder
 
-    def apply_entropy_jaccard_on_co_matrix(self, freq_matrix: Dict, num_triples: int):
+    def apply_entropy_jaccard_on_entitiy_adj_matrix(self, freq_adj_matrix: Dict, num_triples: int):
         """
         Calculate Shannon entropy weighted jaccard from freq_matrix
                 A=  Sum of entropies of overlapping elements
@@ -337,11 +303,11 @@ class Parser:
         :return: Mapping from points to a mapping containing a point and positive jaccard sim.
         """
 
-        entropies, co_occurrences = self.calculate_entropies(freq_matrix, num_triples)
+        entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
 
-        top_k_sim, negatives = self.calculate_entropy_jaccard(entropies, co_occurrences)
+        holder = self.calculate_entropy_jaccard(entropies, co_occurrences)
 
-        return top_k_sim, negatives
+        return holder
 
     @performance_debugger('Calculating entropy weighted Jaccard index')
     def efficient_calculate_entropy_jaccard(self, entropies, contexts):
@@ -449,85 +415,34 @@ class Parser:
 
         """
 
-    def calculate_entropy_jaccard(self, entroies, domain):
+    def calculate_entropy_jaccard(self, entropies:np.array, domain:np.array):
 
-        top_k_sim = dict()
-        negatives = dict()
-
+        print(entropies)
+        print(domain)
+#        exit(1)
+        holder=list()
 
         for i, domain_i in enumerate(domain):
+            top_k_sim = dict()
+            negatives = dict()
             top_k_sim.setdefault(i, dict())
             negatives.setdefault(i, list())
 
-            sum_ent_domain_i = entroies[domain_i].sum()
+            sum_ent_domain_i = entropies[domain_i].sum()
 
             for j in domain_i:
 
                 domain_j = domain[j]
+
+
+
 
                 intersection = snp.intersect(domain_i, domain_j)
 
                 if len(intersection) > 1:
                     if len(top_k_sim[i]) <= self.K:
 
-                        sum_ent_domain_j = entroies[domain_j].sum()
-                        sim = entroies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
-                        top_k_sim[i][j] = sim
-                    else:
-                        for k, v in top_k_sim[i].items():
-                            sim = entroies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
-
-                            if v < sim:
-                                top_k_sim[i][j] = np.around(sim, 6)
-                                del top_k_sim[i][k]
-                                break
-                else:
-                    if len(negatives[i]) <= self.K:
-                        negatives[i].append(j)
-
-        assert len(top_k_sim) == len(negatives)
-
-        top_k_sim = np.array(list(top_k_sim.values()))
-        return top_k_sim, negatives
-
-    def apply_similarity(self, freq_matrix, num_triples):
-
-        entropies, co_occurence = self.calculate_entropies(freq_matrix, num_triples)
-
-        row = list()
-        col = list()
-        data = list()
-
-        num_of_unqiue_entities = len(freq_matrix)
-        for target_entitiy, co_info in freq_matrix.items():
-            l = dict(Counter(co_info))
-
-            row.extend(np.array([target_entitiy] * len(l), dtype=np.uint32))
-            col.extend(np.array(list(l.keys()), dtype=np.uint32))
-
-            data.extend(entropies[list(l.values())])
-
-        sparse_m = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
-
-        get_to_K = 10
-        top_k_sim = dict()
-        negatives = dict()
-
-        for i in range(len(entropies)):
-            top_k_sim.setdefault(i, dict())
-            negatives.setdefault(i, list())
-
-            subjects_to_be_compared = sparse_m[i].dot(sparse_m).data.argsort()[-get_to_K:][::-1]
-
-            sum_ent_domain_i = entropies[i].sum()
-
-            for j in subjects_to_be_compared:
-                sum_ent_domain_j = entropies[j].sum()
-                intersection = snp.intersect(co_occurence[i], co_occurence[j])
-
-                if len(intersection) > 0:
-                    if len(top_k_sim[i]) <= self.K:
-                        sum_ent_domain_j = entropies[co_occurence[j]].sum()
+                        sum_ent_domain_j = entropies[domain_j].sum()
                         sim = entropies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
                         top_k_sim[i][j] = sim
                     else:
@@ -538,11 +453,196 @@ class Parser:
                                 top_k_sim[i][j] = np.around(sim, 6)
                                 del top_k_sim[i][k]
                                 break
-            negatives[i] = np.random.choice(len(entropies), self.K, replace=False)
+                else:
+                    if len(negatives[i]) <= self.K:
+                        negatives[i].append(j)
 
-        top_k_sim = np.array(list(top_k_sim.values()))
+            context=np.array(list(top_k_sim[i].keys()),dtype=np.uint32)
+            sim=np.array(list(top_k_sim[i].values()),dtype=np.uint32)
+            sim.shape = (sim.size, 1)
 
-        return top_k_sim, negatives
+            repulsives=np.array(negatives[i],dtype=np.uint32)
+
+            del top_k_sim
+            del negatives
+            holder.append((context,sim,repulsives))
+
+        return holder
+
+    # TODO apply both seach and spectral custerin on tf-idf and and entropy co-occurrences.
+    # TODO thereafter for each vocabulary term find most similar K terms
+    def apply_similarity_on_laplacian(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> typing.Tuple[dict,dict]:
+        """
+        Partition the graph into two pieces such the resultsing pieces have low conductance
+
+        Spectral Graph Partitioning
+
+        Graph Laplacian
+        :param freq_adj_matrix:
+        :param num_triples:
+        :return:
+        """
+
+
+        row = list()
+        col = list()
+        data = list()
+
+        num_of_unqiue_entities = len(freq_adj_matrix)
+        for i, co_info in freq_adj_matrix.items():
+            vals = np.array(list(co_info.values())).sum()
+            row.extend(np.array([i]))
+            col.extend(np.array([i]))
+            data.extend(np.array([vals]))
+
+
+            j=list(co_info.keys())
+            vals=np.array(list(co_info.values()))
+
+            row.extend(np.array([i] * len(j)))
+
+            col.extend(j)
+
+            data.extend(-1*vals)
+
+        laplacian_matrix = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+
+        print(laplacian_matrix.toarray())
+
+
+        exit(1)
+
+    def apply_entropy_jaccard_with_connected_component_analysis(self,freq_adj_matrix: typing.Dict[int, Counter], num_triples: int):
+        """
+        Construc entropy adjeseny matrix Thereafter apply analysis of connected components of a sparse graph.
+
+        Calculate jaccard similarty measure on connected components
+        :param freq_adj_matrix:
+        :param num_triples:
+        :return:
+        """
+
+
+        entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
+
+        row = list()
+        col = list()
+        data = list()
+
+        num_of_unqiue_entities = len(freq_adj_matrix)
+        for i, co_info in freq_adj_matrix.items():
+
+            j=list(co_info.keys())
+            vals=np.array(list(co_info.values()))
+
+            row.extend(np.array([i] * len(j)))
+
+            col.extend(j)
+
+            data.extend(entropies[vals])
+
+        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+
+        n_components, labels = connected_components(csgraph=entropy_adj_matirx, directed=False, return_labels=True)
+
+        print('Found components')
+        for i_component in range(n_components):
+            itemindex = np.where(labels == i_component)[0]
+            print(len(itemindex))
+
+
+        exit(1)
+        pass
+
+    def apply_entropy_jaccard_with_networkx(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int):
+        """
+        Construc entropy adjeseny matrix Thereafter apply analysis of connected components of a sparse graph.
+
+        Calculate jaccard similarty measure on connected components
+        :param freq_adj_matrix:
+        :param num_triples:
+        :return:
+        """
+        entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
+
+        for i, domain_i in enumerate(co_occurrences):
+
+            # get top K highest entropy from domain:
+
+            for j in domain_i:
+                # get top K highest entriofy from each domain
+                pass
+            break
+
+#            compare i with K^2 terms
+
+
+
+        exit(1)
+        import networkx as nx
+        from networkx.algorithms import approximation
+        from networkx.algorithms.traversal import depth_first_search
+        entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
+        del co_occurrences
+
+
+        row = list()
+        col = list()
+        data = list()
+
+        num_of_unqiue_entities = len(freq_adj_matrix)
+        for i, co_info in freq_adj_matrix.items():
+
+            j=list(co_info.keys())
+            vals=np.array(list(co_info.values()))
+
+            row.extend(np.array([i] * len(j)))
+
+            col.extend(j)
+
+            data.extend(entropies[vals])
+
+        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+
+
+        G = nx.from_scipy_sparse_matrix(entropy_adj_matirx)
+        #del entropy_adj_matirx
+ #       k_components = approximation.min_maximal_matching(G)
+#        print(k_components)
+        #print(list(nx.dfs_predecessors(G, source=3)))
+        #https://networkx.github.io/documentation/stable/reference/algorithms/generated/networkx.algorithms.approximation.connectivity.local_node_connectivity.html#networkx.algorithms.approximation.connectivity.local_node_connectivity
+
+
+        l=np.array(MiniBatchKMeans(n_clusters=10).fit(entropy_adj_matirx).labels_)
+        print(l)
+        exit(1)
+        pass
+
+    def construct_entitiy_adj_matrix_from_list(self,kb:typing.List[Tuple[str,str,str]]):
+
+        num_of_rdf=len(kb)
+        binary_adj_matrix = {}
+        vocabulary = {}
+        entities_to_indexes = {}
+
+        for s, p, o in kb:
+            # mapping from string to vocabulary
+            vocabulary.setdefault(s, len(vocabulary))
+            entities_to_indexes[s] = vocabulary[s]
+
+
+            vocabulary.setdefault(o, len(vocabulary))
+            entities_to_indexes[o] = vocabulary[o]
+
+            binary_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[o]] += 1
+            binary_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[s]] += 1
+
+
+        holder = self.similarity_function(binary_adj_matrix, num_of_rdf)
+
+
+        return holder
+
 
     def get_path_knowledge_graphs(self, path: str):
         """
@@ -565,48 +665,32 @@ class Parser:
             exit(1)
         return KGs
 
-    def is_literal_in_rdf(self, sentence):
-        """
-        Apply heuristic to find whether RDF contains Literals.
-
-        Look at " symbol occurs after second occurrence of  >
-        :param sentence:
-        :return:
-        """
-        if '> "' in sentence:
-            return True
-        return False
-
     def decompose_rdf(self, sentence):
 
-        flag=0
-        # if self.is_literal_in_rdf(sentence):
+        flag = 0
 
-        # return matching patter
-        # return <what written here>
-        # so "kinase activity"^^ <...> ignored
         components = re.findall('<(.+?)>', sentence)
         if len(components) == 2:
             s, p = components
             remaining_sentence = sentence[sentence.index(p) + len(p) + 2:]
             literal = remaining_sentence[:-1]
             o = literal
-            flag=2
+            flag = 2
 
         elif len(components) == 4:
             del components[-1]
             s, p, o = components
 
-            flag=4
+            flag = 4
 
         elif len(components) == 3:
             s, p, o = components
             flag = 3
 
-            if '"' in sentence:
-                remaining=sentence[len(s)+len(p)+5:]
-                literal=remaining[1:remaining.index(' <http://')]
-                o=literal
+            # if '"' in sentence:
+            #    remaining = sentence[len(s) + len(p) + 5:]
+            #    literal = remaining[1:remaining.index(' <http://')]
+            #    o = literal
 
         elif len(components) > 4:
 
@@ -620,18 +704,17 @@ class Parser:
 
             ## This means that literal contained in RDF triple contains < > symbol
             """ pass"""
-            flag=0
+            flag = 0
             # print(sentence)
             raise ValueError()
 
+        # o = re.sub("\s+", "", o)
 
-        #o = re.sub("\s+", "", o)
+        # s = re.sub("\s+", "", s)
 
-        #s = re.sub("\s+", "", s)
+        # p = re.sub("\s+", "", p)
 
-        #p = re.sub("\s+", "", p)
-
-        return s, p, o,flag
+        return s, p, o, flag
 
     @performance_debugger('Parse RDF triples to co occurrence matrix')
     def create_dic_from_text(self, f_name: str, bound: int):
@@ -651,11 +734,9 @@ class Parser:
 
         p_knowledge_graphs = self.get_path_knowledge_graphs(f_name)
 
-
         writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
 
         for f_name in p_knowledge_graphs:
-
 
             if f_name[-4:] == '.bz2':
                 reader = BZ2File(f_name, "r")
@@ -666,25 +747,23 @@ class Parser:
 
             for sentence in reader:
                 if isinstance(sentence, bytes):
-#                    sentence = sentence.decode('utf-8')
-                    sentence = sentence.decode('ascii')
+                    sentence = sentence.decode('utf-8')
+                #                    sentence = sentence.decode('ascii')
 
                 if total_sentence == bound: break
 
                 #             if ('rdf-schema#' in sentence) or ('description' in sentence):
-  #                  pass
- #               else:
-#                    continue
+                #                  pass
+                #               else:
+                #                    continue
 
-#                if '"' in sentence:
- #                   continue
-
-
+                #                if '"' in sentence:
+                #                   continue
 
                 try:
-                    s, p, o,flag= self.decompose_rdf(sentence)
+                    s, p, o, flag = self.decompose_rdf(sentence)
 
-                    if not ( (flag == 4) or (flag==3)or (flag==2)):
+                    if not ((flag == 4) or (flag == 3) or (flag == 2)):
                         print(sentence)
                     #    print('exitting')
                     #   continue
@@ -694,12 +773,11 @@ class Parser:
 
                 total_sentence += 1
 
-#                processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
- #               writer_kb.write(processed_triples)
+                #                processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
+                #               writer_kb.write(processed_triples)
                 writer_kb.write(sentence)
                 # Replace each next line character with space.
-                #writer_kb.write(re.sub("<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3> .", ".", sentence))
-
+                # writer_kb.write(re.sub("<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3> .", ".", sentence))
 
                 # mapping from string to vocabulary
                 vocabulary.setdefault(s, len(vocabulary))
@@ -842,7 +920,10 @@ class Parser:
         else:
             freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
 
-        string_vocab=np.array(list(vocab.keys()))
+        print(vocab)
+        print(sys.getsizeof(freq_matrix) / 1000000)
+        exit(1)
+        string_vocab = np.array(list(vocab.keys()))
         indexes_of_subjects = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
         indexes_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
 
@@ -851,19 +932,17 @@ class Parser:
         del indexes_of_subjects
         del indexes_of_predicates
 
-        valid_subjects=string_vocab[indexes_of_valid_subjects]
+        valid_subjects = string_vocab[indexes_of_valid_subjects]
         ut.serializer(object_=valid_subjects, path=self.p_folder, serialized_name='subjects')
 
-        num_subjects=len(subjects_to_indexes)
+        num_subjects = len(subjects_to_indexes)
         del subjects_to_indexes
-
 
         print('Number of valid subjects for DL-Learner', len(indexes_of_valid_subjects))
         print('Size of vocabulary', len(vocab))
         print('Number of RDF triples', num_triples)
         print('Number of subjects', num_subjects)
         print('Number of predicates', len(predicates_to_indexes))
-
 
         Saver.settings.append("Size of vocabulary:" + str(len(vocab)))
         Saver.settings.append("Number of RDF triples:" + str(num_triples))
@@ -872,27 +951,19 @@ class Parser:
         Saver.settings.append("Number of valid subjects for DL-Learner:" + str(indexes_of_valid_subjects))
         del vocab
 
-
-        ut.serializer(object_=indexes_of_valid_subjects, path=self.p_folder, serialized_name='indexes_of_valid_subjects')
+        ut.serializer(object_=indexes_of_valid_subjects, path=self.p_folder,
+                      serialized_name='indexes_of_valid_subjects')
         del indexes_of_valid_subjects
-
 
         texec = ThreadPoolExecutor(4)
         future = texec.submit(self.similarity_function, freq_matrix, num_triples)
 
-
-
-
         del freq_matrix
-
-
 
         f = future.result()
 
         top_k_sim = f[0]
         negatives = f[1]
-
-
 
         return top_k_sim, negatives
 
@@ -989,6 +1060,157 @@ class Parser:
 
         return attractives, repulsive_entities
 
+    def apply_ppmi_on_entitiy_adj_matrix(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> typing.Tuple[dict,dict]:
+        """
+
+        :param freq_adj_matrix: is mapping from the index of entities to Counter object.
+                Counter object contains the index of co-occurring entities and the respectiveco-occurrences
+        :param num_triples:
+        :return:
+        """
+
+        marginal_probs = np.array([sum(context.values()) for i, context in freq_adj_matrix.items()],
+                                  dtype=np.uint32) / num_triples
+
+        holder = list()
+
+
+
+        for unq_ent, contexts_w_co_freq in freq_adj_matrix.items():
+            top_k_sim = dict()
+            negatives = dict()
+
+            marginal_prob_of_target = marginal_probs[unq_ent]
+
+            top_k_sim.setdefault(unq_ent, dict())
+
+            for context_ent, co_freq in contexts_w_co_freq.items():
+
+                joint_prob = round(co_freq / num_triples, 5)
+
+                marginal_prob_of_context = marginal_probs[context_ent]
+
+                denominator = marginal_prob_of_target * marginal_prob_of_context
+
+                try:
+                    PMI_val = round(math.log2(joint_prob) - math.log2(denominator), 5)
+                except ValueError:
+                    continue
+
+                if len(top_k_sim[unq_ent]) <= self.K:
+                    top_k_sim[unq_ent][context_ent] = PMI_val
+                else:
+                    for k, v in top_k_sim[unq_ent].items():
+                        if v < PMI_val:
+                            top_k_sim[unq_ent][context_ent] = PMI_val
+                            del top_k_sim[unq_ent][k]
+                            break
+
+            n = np.random.choice(len(freq_adj_matrix), self.K, replace=False)
+
+            negatives[unq_ent] = np.setdiff1d(n, list(contexts_w_co_freq.keys()))
+
+            context = np.array(list(top_k_sim[unq_ent].keys()), dtype=np.uint32)
+            sim = np.array(list(top_k_sim[unq_ent].values()), dtype=np.uint32)
+            sim.shape = (sim.size, 1)
+
+            repulsives = np.array(negatives[unq_ent], dtype=np.uint32)
+
+            del top_k_sim
+            del negatives
+            holder.append((context, sim, repulsives))
+
+        return holder
+
+    @performance_debugger('Constructing entitiy adj matrix')
+    def construct_entity_adj_matrix(self, f_name, bound=''):
+        vocabulary = None
+        freq_adj_matrix = None
+        num_of_rdf = None
+        index_to_valid_sub=None
+
+        # Todo IDEA, do not save valid indexes but while reading write into file
+
+        if isinstance(bound, int):
+            freq_adj_matrix, vocabulary, num_of_rdf, index_to_valid_sub = self.process_file(f_name, bound)
+
+        else:
+            print('not yet implemented')
+            exit(1)
+
+
+        ut.serializer(object_=np.array(list(index_to_valid_sub.keys()),dtype=np.uint32), path=self.p_folder, serialized_name='indexes_of_valid_subjects')
+        ut.serializer(object_=list(index_to_valid_sub.values()), path=self.p_folder, serialized_name='subjects')
+
+        del index_to_valid_sub
+
+        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
+        del vocabulary
+
+        holder = self.similarity_function(freq_adj_matrix, num_of_rdf)
+
+
+        return holder
+    def process_file(self, path, bound):
+
+        freq_adj_matrix = {}
+        vocabulary = {}
+        num_of_rdf = 0
+        i_vocab=dict()
+        p_knowledge_graphs = self.get_path_knowledge_graphs(path)
+
+        writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
+
+        for f_name in p_knowledge_graphs:
+
+            if f_name[-4:] == '.bz2':
+                reader = BZ2File(f_name, "r")
+            else:
+                reader = open(f_name, "r")
+
+            total_sentence = 0
+
+            for sentence in reader:
+                if isinstance(sentence, bytes):
+                    sentence = sentence.decode('utf-8')
+
+                if total_sentence == bound: break
+
+                try:
+                    s, p, o, flag = self.decompose_rdf(sentence)
+
+                    if flag != 3:
+                        # print(sentence)
+                        continue
+                except ValueError:
+                    continue
+                total_sentence += 1
+
+                writer_kb.write(sentence)
+
+                # mapping from string to vocabulary
+                vocabulary.setdefault(s, len(vocabulary))
+                # entities_to_indexes[s] = vocabulary[s]
+                i_vocab.setdefault(len(vocabulary),s)
+
+                # vocabulary.setdefault(p, len(vocabulary))
+
+                vocabulary.setdefault(o, len(vocabulary))
+                # entities_to_indexes[o] = vocabulary[o]
+
+                freq_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[o]] += 1
+                freq_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[s]] += 1
+
+            reader.close()
+            num_of_rdf += total_sentence
+
+        writer_kb.close()
+        # TODO think later bout predicates
+        print('Number of RDF triples in the input KG:', num_of_rdf)
+        print('Number of entities:', len(vocabulary))
+
+        return freq_adj_matrix, vocabulary, num_of_rdf,i_vocab
+
 
 class PL2VEC(object):
     def __init__(self, system_energy=1):
@@ -1000,8 +1222,6 @@ class PL2VEC(object):
         self.total_distance_from_repulsives = list()
         self.ratio = list()
         self.system_energy = system_energy
-
-
 
     @staticmethod
     def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
@@ -1019,14 +1239,15 @@ class PL2VEC(object):
         assert len(context_entitiy_pms) == len(repulsitve_entities)
 
         holder = list()
+        for index_of_i, top_k_index in context_entitiy_pms.items():
 
-        for index, item in enumerate(context_entitiy_pms):
-            context = np.array(list(item.keys()), dtype=np.int32)
+            context = np.array(list(top_k_index.keys()), dtype=np.int32)
 
-            pms = np.around(list(item.values()), 3).astype(np.float32)
+
+            pms = np.around(list(top_k_index.values()), 3).astype(np.float32)
             pms.shape = (pms.size, 1)
 
-            repulsive = np.array(list(repulsitve_entities[index]), dtype=np.int32)
+            repulsive = np.array(list(repulsitve_entities[index_of_i]), dtype=np.int32)
 
             holder.append((context, pms, repulsive))
         del repulsitve_entities
@@ -1094,7 +1315,7 @@ class PL2VEC(object):
             agg_att_d += abs_att_dost
             agg_rep_d += abs_rep_dist
 
-        return e, 0#agg_att_d / agg_rep_d
+        return e, 0  # agg_att_d / agg_rep_d
 
     @performance_debugger('Generating Embeddings:')
     def start(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
@@ -1108,7 +1329,7 @@ class PL2VEC(object):
             e, d_ratio = self.go_through_entities(e, holder, negative_constant, self.system_energy)
 
             self.system_energy = self.system_energy - energy_release_at_epoch
-            #self.ratio.append(d_ratio)
+            # self.ratio.append(d_ratio)
 
             # e[np.isnan(np.inf)] = e.max()
 
@@ -1602,8 +1823,6 @@ class DataAnalyser(object):
 
         sampled_total_entities = pd.DataFrame()
 
-
-
         for label in labels:
             cluster = labeled_embeddings.loc[labeled_embeddings.labels == label].copy()
             mean_of_cluster = cluster.mean()
@@ -1617,7 +1836,7 @@ class DataAnalyser(object):
 
         sampled_total_entities.drop(['euclidean_distance_to_mean'], axis=1, inplace=True)
 
-        representative_entities=dict()
+        representative_entities = dict()
         for key, val in sampled_total_entities.labels.to_dict().items():
             representative_entities.setdefault(val, []).append(key)
 
@@ -1641,20 +1860,18 @@ class DataAnalyser(object):
         # Prune those subject that occurred in predicate position
         # index_of_only_subjects = np.setdiff1d(index_of_resources, index_of_predicates)
 
-        #i_vocab = ut.deserializer(path=self.p_folder, serialized_name="i_vocab")
+        # i_vocab = ut.deserializer(path=self.p_folder, serialized_name="i_vocab")
 
-        #names = np.array(list(i_vocab.values()))[index_of_only_subjects]
+        # names = np.array(list(i_vocab.values()))[index_of_only_subjects]
 
         # PRUNE non subject entities
         embeddings = embeddings[index_of_only_subjects]
         del index_of_only_subjects
 
-        names=ut.deserializer(path=self.p_folder, serialized_name="subjects")
+        names = ut.deserializer(path=self.p_folder, serialized_name="subjects")
 
-
-        embeddings = pd.DataFrame(embeddings,index=names)
+        embeddings = pd.DataFrame(embeddings, index=names)
         del names
-
 
         return embeddings
 
@@ -1730,7 +1947,7 @@ class DataAnalyser(object):
         embeddings_of_resources = self.prune_non_subject_entities(E)
 
         # Partition total embeddings into number of 10
-        #embeddings_of_resources = self.apply_partitioning(embeddings_of_resources, partitions=50, samp_part=10)
+        # embeddings_of_resources = self.apply_partitioning(embeddings_of_resources, partitions=50, samp_part=10)
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
@@ -1739,13 +1956,11 @@ class DataAnalyser(object):
         ut.serializer(object_=pseudo_labelled_embeddings, path=self.p_folder,
                       serialized_name='pseudo_labelled_resources')
 
-
         Saver.settings.append("### cluster distribution##")
         Saver.settings.append(pseudo_labelled_embeddings.labels.value_counts().to_string())
         Saver.settings.append("##" * 20)
 
         representative_entities = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
-
 
         Saver.settings.append('Num of generated clusters: ' + str(len(list(representative_entities.keys()))))
 
@@ -1969,7 +2184,7 @@ class DataAnalyser(object):
 
             candidates_of_negative_subjects = np.setdiff1d(all_samples, positive_subjects)
 
-            sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects),replace=False)
+            sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects), replace=False)
 
             self.create_config(self.p_folder + '/' + str(cluster_label), positive_subjects, sampled_negatives)
 
@@ -1992,7 +2207,7 @@ class DataAnalyser(object):
         # vocab.p is mapping from string to pos
         # str_subjects = list(pickle.load(open(path + "/subjects_to_indexes.p", "rb")).keys())
 
-#        str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects').keys())
+        #        str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects').keys())
 
         # for key, val in dict_of_cluster_with_original_term_names.items():
         #    dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
