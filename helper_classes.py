@@ -3,11 +3,13 @@ import pickle
 import re
 import math
 from bz2 import BZ2File
-from collections import Counter, deque
+import bz2
+from collections import Counter, defaultdict
 import itertools
 from scipy import spatial
 from sklearn.cluster import DBSCAN, MiniBatchKMeans
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.manifold import TSNE
+
 import util as ut
 import os.path
 import matplotlib.pyplot as plt
@@ -19,18 +21,20 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict
-
 from typing import Tuple
 import typing
 from scipy import sparse
-import sys
-
 import warnings
 import sortednp as snp
-from scipy.sparse.csgraph import connected_components
+import sys
+from abc import ABC, abstractmethod
+import hdbscan
+import seaborn as sns
 
-#warnings.filterwarnings('error')
+print('Do not forget warnigngs')
+warnings.filterwarnings('ignore')
+defined_min = np.finfo(np.float32).min
+defined_max = np.finfo(np.float32).max
 
 
 def performance_debugger(func_name):
@@ -38,14 +42,11 @@ def performance_debugger(func_name):
         def debug(*args, **kwargs):
             long_string = ''
             starT = time.time()
-            #            long_string += '\n'
-            #            long_string += '#####' * 10 + '\n'
             print('\n######', func_name, ' starts ######')
             r = func(*args, **kwargs)
             print(func_name, ' took ', time.time() - starT, ' seconds\n')
             long_string += str(func_name) + ' took:' + str(time.time() - starT) + ' seconds'
             Saver.settings.append(long_string)
-
             return r
 
         return debug
@@ -53,21 +54,320 @@ def performance_debugger(func_name):
     return function_name_decoratir
 
 
+class SimilarityCalculator(ABC):
+    def __init__(self):
+        self._inverted_index = None
+        self._num_triples = None
+
+    @abstractmethod
+    def get_similarities(self, inverted_index, num_triples,top_K):
+        pass
+
+
+class PPMI(SimilarityCalculator):
+    def __init__(self):
+        """
+
+        :param co_occurrences: term to list of terms
+        :param num_triples:
+        """
+        super().__init__()
+        self._marginal_probs = None
+
+    def calculate_marginal_probabilities(self):
+        marginal_probs = dict()
+        for unq_ent, list_of_context_ent in enumerate(self.inverted_index):
+            # N is multipled by 2 as list_of_context_ent contains other two element of an RDF triple
+            probability = len(list_of_context_ent) / (self._num_triples * 2)
+
+            marginal_probs[unq_ent] = probability
+        self._marginal_probs = marginal_probs
+
+
+    @performance_debugger('Calculation of PPMIs')
+    def calculate_ppmi(self) -> np.array:
+
+        holder=list()
+
+        for unq_ent, list_of_context_ent in enumerate(self.inverted_index):
+            top_k_sim = dict()
+
+            marginal_prob_of_target = self._marginal_probs[unq_ent]
+
+            statistical_info_of_cooccurrences = Counter(list_of_context_ent)
+
+
+            top_k_sim.setdefault(unq_ent, dict())
+
+            for context_ent, co_occuring_freq in statistical_info_of_cooccurrences.items():
+
+                joint_prob = co_occuring_freq / self._num_triples
+
+                marginal_prob_of_context = self._marginal_probs[context_ent]
+
+                denominator = marginal_prob_of_target * marginal_prob_of_context
+
+                PMI_val = np.log2(joint_prob) - np.log2(denominator)
+
+                if PMI_val<=0:
+                    continue
+
+                if len(top_k_sim[unq_ent]) <= self._topK:
+                    top_k_sim[unq_ent][context_ent] = PMI_val.astype(np.float32)
+                else:
+                    for k, v in top_k_sim[unq_ent].items():
+                        if v < PMI_val:
+                            top_k_sim[unq_ent][context_ent] = PMI_val
+                            del top_k_sim[unq_ent][k]
+                            break
+
+
+
+            context = np.array(list(top_k_sim[unq_ent].keys()), dtype=np.uint32)
+            sims = np.array(list(top_k_sim[unq_ent].values()), dtype=np.float32)
+            sims.shape = (sims.size, 1)
+
+            # sampled may contain dublicated variables
+            sampled = np.random.choice(len(self.inverted_index), self._topK*2)
+
+            # negatives must be disjoint from context of k.th vocabulary term and k.term itsel
+            negatives = np.setdiff1d(sampled, np.append(context, unq_ent), assume_unique=True)
+
+            holder.append((context, sims, negatives))
+
+
+
+        return holder
+
+    def get_similarities(self, inverted_index, num_triples,top_K):
+        """
+
+        :param inverted_index:
+        :param num_triples:
+        :return: similarities data structure is a numpy array of dictionaries.
+
+                i.th element of the numpy array corresponds to i.th element in the vocabulary.
+                The dictionary stored in the i.th element:
+                    Key: a vocabulary term
+                    Val: PPMI value
+
+        """
+        self.inverted_index = inverted_index
+        self._num_triples = num_triples
+        self._topK=top_K
+        self.calculate_marginal_probabilities()
+
+        similarities = self.calculate_ppmi()
+
+        return similarities
+
+
+class WeightedJaccard(SimilarityCalculator):
+    def __init__(self, similar_characteristics, p_folder):
+        super().__init__()
+        self._entropies = None
+        self._similar_characteristics = similar_characteristics
+        self._inverted_index = None
+        self._num_triples = None
+        self.p_folder = p_folder
+
+        self._lowerbound=0.09
+        self._upperbound=0.3#0.3
+
+    def calculate_entropies(self):
+        entropies = list()
+
+        for index, postings_list in enumerate(self._inverted_index):
+
+            self._inverted_index[index] = np.array(postings_list, dtype=np.uint32)
+
+            # each vocabulary term contains both co-occurring terms per rdf triple
+            marginal_prob = len(postings_list) / (self._num_triples * 2)
+
+            with np.errstate(divide='raise'):
+                try:
+                    entropies.append(-marginal_prob * np.log2(marginal_prob))
+                except FloatingPointError:
+                    print('entropy of term-', index, ': is set 0')
+                    print('P( term-', index, '- is', marginal_prob)
+                    exit(1)
+
+        self._entropies = np.array(entropies, dtype=np.float32)
+
+        print('Min entropy ', self._entropies.min())
+        print('Mean entropy', self._entropies.mean())
+        print('Median entropy', np.median(self._entropies))
+        print('Variance entropy', np.var(self._entropies))
+        print('Max entropy', self._entropies.max())
+
+    @performance_debugger('Calculate Weighted Jaccard Similarity')
+    def calculate_weighted_jaccard(self, results):
+        """
+        Computes weighted jaccard similarity between subjects whose contexts contains sufficiently enough information.
+        :param results:
+        :return:
+        """
+        def calculate_sim(subjects):
+            """
+            Inverted_index contains each unique subject predicate and object.
+            We select each subject from inverted index and compute similarities given their contex contains suffc.
+            enough inforation.
+            Thereafter each index reindex starting from 0 to N.
+            :param subjects:
+            :return:
+            """
+
+            #            l = [vocabulary[i] for i in subjects]
+            #           print(l)
+
+            for i in subjects:
+                context_i = self._inverted_index[i]
+                sum_ent_context_i = self._entropies[context_i].sum()
+
+                re_indexer.setdefault(i, len(re_indexer))
+                similarities.setdefault(re_indexer[i], dict())
+
+                for j in subjects:
+                    if i==j:
+                        continue
+
+
+                    re_indexer.setdefault(j, len(re_indexer))
+                    context_j = self._inverted_index[j]
+                    sum_ent_context_j = self._entropies[context_j].sum()
+
+                    intersection = snp.intersect(context_i, context_j)
+
+                    sum_ent_intersection = self._entropies[intersection].sum()
+
+                    sim = 2*sum_ent_intersection / (sum_ent_context_i + sum_ent_context_j)
+
+                    #print(vocabulary[i],'',vocabulary[j],'=',sim)
+                    if sim > 0:
+                        similarities.setdefault(re_indexer[j], dict())
+
+                        similarities[re_indexer[i]][re_indexer[j]] = sim
+                        similarities[re_indexer[j]][re_indexer[i]] = sim
+
+        similarities = dict()
+        re_indexer = dict()
+
+        #vocabulary = np.array(ut.deserializer(path=self.p_folder, serialized_name='vocabulary'))
+
+
+        seen = set()
+        for groups in results:
+
+            if not groups:
+                print('empty')
+                continue
+
+            for subjects in groups:
+
+                str_ = np.array_str(subjects)
+
+                if str_ in seen:
+                    continue
+                else:
+                    seen.add(str_)
+                calculate_sim(subjects)
+
+        ut.serializer(object_=re_indexer, path=self.p_folder, serialized_name='re_indexer')
+        return similarities
+
+    @performance_debugger('Pruning less information p-o pairs')
+    def prune_pairs_of_p_o(self):
+        def gen():
+            print('lower bound', self._lowerbound, ' - upper bound', self._upperbound)
+
+            for p, l_p in self._similar_characteristics.items():
+
+                objects = np.array(list(l_p.keys()))
+                sum_of_ent_of_p_objects = self._entropies[objects] + self._entropies[p]
+
+                valid_objects_to_be_paired = objects[
+                    (sum_of_ent_of_p_objects >= self._lowerbound) & (sum_of_ent_of_p_objects <= self._upperbound)]
+                if valid_objects_to_be_paired.size > 0:
+                    yield p, valid_objects_to_be_paired
+
+        def delete_empty_results(futures):
+            """
+            Futures is a list of future objects of similarity computations.
+            Each item in the list contains similarity computations between a predicate p and a list of objects occurred with p
+
+
+            :param futures: list of future objects
+            :return:
+            """
+            for f in futures:
+                result = f.result()
+                if result:
+                    yield result
+
+
+        def get_intersections(context_p, context_l_o):
+
+            subjects = list()
+            for context_of_o in context_l_o:
+                intersection = snp.intersect(context_p, context_of_o)
+                if intersection.size > 1:
+                    subjects.append(intersection)
+            return subjects
+
+        vocabulary = ut.deserializer(path=self.p_folder, serialized_name='vocabulary')
+
+        pruned_p_o_pairs = gen()
+
+        e = ThreadPoolExecutor(8)
+        futures = []
+        for p, list_o in pruned_p_o_pairs:
+            print('Predicates: ', vocabulary[p])
+            context_p = self._inverted_index[p]
+            context_l_o = [self._inverted_index[_] for _ in list_o]
+            futures.append(e.submit(get_intersections, context_p, context_l_o))
+
+        return delete_empty_results(futures)
+
+    def get_similarities(self, inverted_index, num_triples):
+
+        self._inverted_index = inverted_index
+        self._num_triples = num_triples
+
+        self.calculate_entropies()
+
+        similarities = self.calculate_weighted_jaccard(self.prune_pairs_of_p_o())
+
+        similarities= np.array(list(similarities.values()))
+
+        print('|subjects|',len(similarities))
+
+        return similarities
+
+
 class Parser:
-    def __init__(self, logger=False, p_folder: str = 'not initialized', K='not init'):
+    def __init__(self, logger=False, p_folder: str = 'not initialized', k=1):
         self.path = 'uninitialized'
         self.logger = logger
         self.p_folder = p_folder
         self.similarity_function = None
-        self.K = int(K)
+        self.similarity_measurer = None
+        self.K = int(k)
 
     def set_similarity_function(self, f):
         self.similarity_function = f
         Saver.settings.append('similarity_function:' + repr(f))
 
+    def set_similarity_measure(self, f):
+        self.similarity_measurer = f
+        Saver.settings.append('similarity_function:' + repr(f))
+
     def set_experiment_path(self, p):
         self.p_folder = p
 
+    def set_k_entities(self, k):
+        self.K = k
+
+    """
     @staticmethod
     def calculate_marginal_probabilities(binary_co_matrix: Dict, number_of_rdfs: int):
         marginal_probs = dict()
@@ -79,26 +379,14 @@ class Parser:
         return marginal_probs
 
     @performance_debugger('Calculating entropies')
-    def calculate_entropies(self, freq_adj_matrix: Dict, number_of_rdfs: int) -> typing.Tuple[np.array,np.array]:
-        """
-         Calculate shannon entropy for each vocabulary term.
-
-         ###### Parse RDF triples to co occurrence matrix  starts ######
-        :param freq_adj_matrix:
-        :param number_of_rdfs:
-        :return:
-        """
-
-        co_occurrings = deque()
+    def calculate_entropies(self, freq_adj_matrix: Dict, number_of_rdfs: int) -> typing.Tuple[np.array, np.array]:
+        co_occurrences = deque()
         entropies = deque()
 
         for unq_ent, contexts_w_co_freq in freq_adj_matrix.items():
 
-
             marginal_prob = sum(contexts_w_co_freq.values()) / number_of_rdfs
-
-
-            co_occurrings.append(np.array(list(contexts_w_co_freq.keys()),dtype=np.uint32))
+            co_occurrences.append(np.array(list(contexts_w_co_freq.keys()), dtype=np.uint32))
 
             with np.errstate(divide='raise'):
                 try:
@@ -111,7 +399,11 @@ class Parser:
 
         entropies = np.array(entropies, dtype=np.float32)
 
-        return entropies, np.array(co_occurrings)
+        ut.serializer(object_=entropies, path=self.p_folder, serialized_name='entropies')
+        # todo what is the type of co_pccurrences
+        ut.serializer(object_=np.array(co_occurrences), path=self.p_folder, serialized_name='co_occurrences')
+
+        return entropies, np.array(co_occurrences)
 
     def calculate_ppmi(self, binary_co_matrix: Dict, marginal_probs: Dict, number_of_rdfs) -> Dict:
         top_k_sim = dict()
@@ -156,271 +448,83 @@ class Parser:
 
         return top_k_sim, negatives
 
-    def apply_ppmi_on_co_matrix(self, binary_co_matrix: Dict, num_triples: int) -> Dict:
-        marginal_probabilities = self.calculate_marginal_probabilities(binary_co_matrix, num_triples)
-        top_similarities, negatives = self.calculate_ppmi(binary_co_matrix, marginal_probabilities, num_triples)
-        return top_similarities, negatives
+    @performance_debugger('Applying apply_entropy_jaccard_new')
+    def apply_entropy_jaccard_new(self, inverted_index: np.array, num_triples: int, inv_p_o: dict):
 
-    @performance_debugger('Jaccards of subjects')
-    def calculatted_e_j_s(self, co_occurrences, entropies, index_of_only_subjects, index_of_only_predicates):
-        top_k_sim = dict()
-        negatives = dict()
+        def calculate_from_p_o():
+            similarities = dict()
+            for __, set_of_subjects in inv_p_o.items():
 
-        most_info = 10
+                #            p,o = __.split(' ')
+                #            p,o=int(p),int(o)
 
-        for subject_a in index_of_only_subjects:
+                for s_i in set_of_subjects:
 
-            top_k_sim.setdefault(subject_a, dict())
-            negatives.setdefault(subject_a, list())
+                    similarities.setdefault(s_i, dict())
 
-            # context of subject contains any co-occurence of a subject predicate or an object
-            context_of_subject_a = co_occurrences[subject_a]
+                    context_i = inverted_index[s_i]
 
-            # domain of subject consists of predicates and objects
+                    sum_ent_context_vocab_i = entropies[context_i].sum()
 
-            domain_of_subject_a = np.setdiff1d(context_of_subject_a, index_of_only_subjects, assume_unique=True)
+                    for s_j in set_of_subjects:
+                        if s_i == s_j or s_j in similarities[s_i]:
+                            continue
 
-            #            domain_of_subject_a = snp.intersect(context_of_subject_a, index_of_only_predicates)
+                        similarities.setdefault(s_j, dict())
 
-            contextes_of_domain_of_subject_a = co_occurrences[domain_of_subject_a]
+                        context_j = inverted_index[s_j]
+                        sum_ent_context_vocab_j = entropies[context_j].sum()
 
-            select_domain_wi = np.array([entropies[i].sum() for i in contextes_of_domain_of_subject_a])
+                        sim = entropies[snp.intersect(context_i, context_j)].sum() / (
+                                sum_ent_context_vocab_j + sum_ent_context_vocab_i)
 
-            most_informative_domain_indexes = select_domain_wi.argsort()[-most_info:][::-1]
+                        similarities[s_i][s_j] = sim
+                        similarities[s_j][s_i] = sim
 
-            most_informative__pre_ob_of_subject_a = domain_of_subject_a[most_informative_domain_indexes]
+            return similarities
 
-            sum_of_ent_context_of_a = entropies[subject_a].sum()
+        entropies = deque()
 
-            for subject_b in most_informative__pre_ob_of_subject_a:
+        for index, postings_list in enumerate(inverted_index):
 
-                intersection = snp.intersect(context_of_subject_a, co_occurrences[subject_b])
+            inverted_index[index] = np.array(postings_list, dtype=np.uint32)
 
-                sum_of_ent_context_of_b = entropies[subject_b].sum()
+            # each vocabulary term contains both co-occurring terms per rdf triple
+            marginal_prob = len(postings_list) / (num_triples * 2)
 
-                sum_of_ent_intersections = entropies[intersection].sum()
+            with np.errstate(divide='raise'):
+                try:
+                    entropies.append(-marginal_prob * np.log2(marginal_prob))
+                except FloatingPointError:
+                    print('entropy of term-', index, ': is set 0')
+                    print('P( term-', index, '- is', marginal_prob)
+                    exit(1)
 
-                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
+        entropies = np.array(entropies, dtype=np.float32)
 
-                if sim > 0:
-                    top_k_sim[subject_a][subject_b] = round(sim, 4)
-
-        return top_k_sim
-
-        """
-        old_subject_index_to_new = dict(zip(indexes_of_subjects, np.arange(len(indexes_of_subjects))))
-
-        for a, context_of_subject_a in enumerate(domain_of_subjects):
-            top_k_sim.setdefault(a, dict())
-            negatives.setdefault(a, list())
-
-            sum_of_ent_context_of_a = entropies[context_of_subject_a].sum()
-
-            for component in context_of_subject_a:
-
-                context_of_b = co_occurrences[component]
-
-                intersection = snp.intersect(context_of_subject_a, context_of_b)
-
-                if len(intersection) < 2:
-                    continue
-
-                sum_of_ent_intersections = entropies[intersection].sum()
-
-                sum_of_ent_context_of_b = entropies[context_of_b].sum()
-
-                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
-
-                if sim > 0 and (component in indexes_of_subjects):
-                    component = old_subject_index_to_new[component]
-                    if len(top_k_sim[a]) <= self.K:
-                        top_k_sim[a][component] = round(sim, 4)
-                    else:
-                        for k, v in top_k_sim[a].items():
-
-                            if v < sim:
-                                top_k_sim[a][component] = sim
-                                del top_k_sim[a][k]
-                                break
-                else:
-                    if len(negatives[a]) <= self.K:
-                        negatives[a].append(component)
-
-            assert len(top_k_sim) == len(negatives)
-        return top_k_sim, negatives
-    
-        """
-
-    def apply_entropy_jaccard_subjects(self, freq_matrix: Dict, index_of_only_subjects, indexes_of_predicates,
-                                       num_triples: int):
-        """
-
-        :param index_of_only_subjects:
-        :param freq_matrix:
-        :param subjects_to_indexes:
-        :param num_triples:
-        :return:
-        """
-
-        holder = list()
-
-        entropies, co_occurrences = self.calculate_entropies(freq_matrix, num_triples)
-
-        top_k_sim = self.calculatted_e_j_s(co_occurrences, entropies, index_of_only_subjects, indexes_of_predicates)
-
-        new_index = dict(zip(list(top_k_sim.keys()), list(range(len(top_k_sim)))))
-
-        for i, index_of_sub in enumerate(index_of_only_subjects):
-            d = top_k_sim[index_of_sub]
-
-            # remove the most similar term as it is dupplicatep
-            attractives = np.array(list(d.keys()))
-
-            attractives = [new_index[i] for i in attractives]
-
-            sim = np.array(list(d.values()), dtype=np.float32).reshape(len(attractives), 1)
-
-            negatives = np.random.choice(len(index_of_only_subjects), len(attractives) * 2)
-
-            T = (attractives, sim, np.setdiff1d(negatives, attractives))
-            holder.append(T)
+        holder = self.choose_to_K_attract_repulsives(similarities)
 
         return holder
 
+    @performance_debugger('Applying Entropy Jaccard ')
     def apply_entropy_jaccard_on_entitiy_adj_matrix(self, freq_adj_matrix: Dict, num_triples: int):
-        """
-        Calculate Shannon entropy weighted jaccard from freq_matrix
-                A=  Sum of entropies of overlapping elements
-                B=  Sum of entropies of all elements that occurred with x
-                C=  Sum of entropies of all elements that occurred with y
+        try:
+            entropies = ut.deserializer(path=self.p_folder, serialized_name='entropies')
+            co_occurrences = ut.deserializer(path=self.p_folder, serialized_name='co_occurrences')
+            print('Entropies and co_occurrences are deserialized.')
+        except:
+            entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
 
-       Sim(x,y) = A / (B+C)
-
-
-        :param subjects_to_indexes:
-        :param freq_matrix: freq_matrix is mapping from a vertex or an edge to co-occurring vertices or edges.
-        :param num_triples:
-        :return: Mapping from points to a mapping containing a point and positive jaccard sim.
-        """
-
-        entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
-
+        print(entropies)
+        print(co_occurrences)
+        exit(1)
         holder = self.calculate_entropy_jaccard(entropies, co_occurrences)
 
         return holder
 
-    @performance_debugger('Calculating entropy weighted Jaccard index')
-    def efficient_calculate_entropy_jaccard(self, entropies, contexts):
-        """
+    def calculate_entropy_jaccard(self, entropies: np.array, domain: np.array):
 
-        :param contexts: ith item  corresponds a numpy array whose each element corresponds with ith vocabulary term.
-        :param entropies:  ith item in entropies indicate the entropy of ith vocabulary term.
-        :return:
-
-        """
-        top_k_sim = dict()
-        negatives = dict()
-        for a, context_of_a in enumerate(contexts):
-            top_k_sim.setdefault(a, dict())
-            negatives.setdefault(a, deque())
-
-            sum_of_ent_context_of_a = sum([entropies[_] for _ in context_of_a])
-
-            for b, context_of_b in enumerate(contexts):
-
-                intersection = context_of_a.intersection(context_of_b)
-
-                sum_of_ent_intersections = sum([entropies[_] for _ in intersection])
-
-                sum_of_ent_context_of_b = sum([entropies[_] for _ in context_of_b])
-
-                sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
-
-                if sim > 0:
-
-                    if len(top_k_sim[a]) <= self.K:
-                        top_k_sim[a][b] = round(sim, 4)
-                    else:
-                        for k, v in top_k_sim[a].items():
-
-                            if v < sim:
-                                top_k_sim[a][b] = sim
-                                del top_k_sim[a][k]
-                                break
-                else:
-                    if len(negatives[a]) <= self.K:
-                        negatives[a].append(b)
-
-        return top_k_sim, negatives
-
-        """
-        texec = ThreadPoolExecutor(4)
-        holder = list()  # .append((context, sim, repulsive))
-        for a, context_of_a in enumerate(contexts):
-
-            similarities = list()
-
-            futures = []
-            for item in all_context_of_component_b:
-                futures.append(
-                    texec.submit(ut.calculate_similarities, context_of_component_a, item, num_array_entropies))
-
-            similarities = [ff.result() for ff in futures]
-
-            print(similarities)
-            exit(1)
-            index_of_top_K = (-similarity_evals_a).argsort()[:self.K]
-            top_K_similarity_val = np.around(similarity_evals_a[index_of_top_K], 4)
-            top_K_similarity_val.shape = (top_K_similarity_val.size, 1)
-
-            possible_negatives = np.argwhere(np.isnan(similarity_evals_a)).flatten()
-
-            if len(possible_negatives) == 0:
-
-                repulsives = np.array([np.argmin(similarity_evals_a)])
-
-            #            N.append(np.argwhere(np.min(similarity_evals_a))[0])
-            elif len(possible_negatives) <= self.K:
-                repulsives = possible_negatives
-            else:
-                repulsives = np.random.choice(possible_negatives, self.K, replace=False)
-
-            holder.append((index_of_top_K, top_K_similarity_val, repulsives))
-        return holder
-        """
-        """
-        for context_of_a in contexts:
-            p_sim_evals_a = deque()
-
-            for context_of_b in contexts:
-                # 2 times more time efficient then setdiff1d of numpy
-                # 1.5 times more time efficient then intersect1d of numpy
-                #intersection = snp.intersect(context_of_a, context_of_b)
-
-                intersection = context_of_a.intersection(context_of_b)
-
-                print(intersection)
-                exit(1)
-                #sum_of_ent_context_of_a = entropies[context_of_a].sum()
-
-                #sum_of_ent_context_of_b = entropies[context_of_b].sum()
-
-                #sum_of_ent_intersections = entropies[intersection].sum()
-
-                #sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
-
-                #p_sim_evals_a.append(sim)
-
-            #jaccard.append(p_sim_evals_a)
-
-        """
-
-    def calculate_entropy_jaccard(self, entropies:np.array, domain:np.array):
-
-        print(entropies)
-        print(domain)
-#        exit(1)
-        holder=list()
+        holder = list()
 
         for i, domain_i in enumerate(domain):
             top_k_sim = dict()
@@ -434,12 +538,9 @@ class Parser:
 
                 domain_j = domain[j]
 
-
-
-
                 intersection = snp.intersect(domain_i, domain_j)
 
-                if len(intersection) > 1:
+                if len(intersection) > 0:
                     if len(top_k_sim[i]) <= self.K:
 
                         sum_ent_domain_j = entropies[domain_j].sum()
@@ -447,43 +548,35 @@ class Parser:
                         top_k_sim[i][j] = sim
                     else:
                         for k, v in top_k_sim[i].items():
-                            sim = entropies[intersection].sum() / (sum_ent_domain_i + sum_ent_domain_j)
+                            sim = entropies[intersection].sum() / (sum_ent_domain_i + entropies[domain_j].sum())
 
                             if v < sim:
-                                top_k_sim[i][j] = np.around(sim, 6)
+                                top_k_sim[i][j] = sim
                                 del top_k_sim[i][k]
                                 break
                 else:
                     if len(negatives[i]) <= self.K:
                         negatives[i].append(j)
 
-            context=np.array(list(top_k_sim[i].keys()),dtype=np.uint32)
-            sim=np.array(list(top_k_sim[i].values()),dtype=np.uint32)
+            context = np.array(list(top_k_sim[i].keys()), dtype=np.uint32)
+            sim = np.array(list(top_k_sim[i].values()))
             sim.shape = (sim.size, 1)
 
-            repulsives=np.array(negatives[i],dtype=np.uint32)
+            repulsives = np.array(negatives[i], dtype=np.uint32)
 
             del top_k_sim
             del negatives
-            holder.append((context,sim,repulsives))
+            holder.append((context, sim, repulsives))
 
         return holder
+    """
 
     # TODO apply both seach and spectral custerin on tf-idf and and entropy co-occurrences.
     # TODO thereafter for each vocabulary term find most similar K terms
-    def apply_similarity_on_laplacian(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> typing.Tuple[dict,dict]:
-        """
-        Partition the graph into two pieces such the resultsing pieces have low conductance
 
-        Spectral Graph Partitioning
-
-        Graph Laplacian
-        :param freq_adj_matrix:
-        :param num_triples:
-        :return:
-        """
-
-
+    """
+    
+    def apply_similarity_on_laplacian(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int)
         row = list()
         col = list()
         data = list()
@@ -495,32 +588,23 @@ class Parser:
             col.extend(np.array([i]))
             data.extend(np.array([vals]))
 
-
-            j=list(co_info.keys())
-            vals=np.array(list(co_info.values()))
+            j = list(co_info.keys())
+            vals = np.array(list(co_info.values()))
 
             row.extend(np.array([i] * len(j)))
 
             col.extend(j)
 
-            data.extend(-1*vals)
+            data.extend(-1 * vals)
 
         laplacian_matrix = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
 
         print(laplacian_matrix.toarray())
 
-
         exit(1)
 
-    def apply_entropy_jaccard_with_connected_component_analysis(self,freq_adj_matrix: typing.Dict[int, Counter], num_triples: int):
-        """
-        Construc entropy adjeseny matrix Thereafter apply analysis of connected components of a sparse graph.
-
-        Calculate jaccard similarty measure on connected components
-        :param freq_adj_matrix:
-        :param num_triples:
-        :return:
-        """
+    def apply_entropy_jaccard_with_connected_component_analysis(self, freq_adj_matrix: typing.Dict[int, Counter],
+                                                                num_triples: int):
 
 
         entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
@@ -531,9 +615,8 @@ class Parser:
 
         num_of_unqiue_entities = len(freq_adj_matrix)
         for i, co_info in freq_adj_matrix.items():
-
-            j=list(co_info.keys())
-            vals=np.array(list(co_info.values()))
+            j = list(co_info.keys())
+            vals = np.array(list(co_info.values()))
 
             row.extend(np.array([i] * len(j)))
 
@@ -541,7 +624,8 @@ class Parser:
 
             data.extend(entropies[vals])
 
-        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
+        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)),
+                                               shape=(num_of_unqiue_entities, num_of_unqiue_entities))
 
         n_components, labels = connected_components(csgraph=entropy_adj_matirx, directed=False, return_labels=True)
 
@@ -550,19 +634,11 @@ class Parser:
             itemindex = np.where(labels == i_component)[0]
             print(len(itemindex))
 
-
         exit(1)
         pass
-
+    """
+    """
     def apply_entropy_jaccard_with_networkx(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int):
-        """
-        Construc entropy adjeseny matrix Thereafter apply analysis of connected components of a sparse graph.
-
-        Calculate jaccard similarty measure on connected components
-        :param freq_adj_matrix:
-        :param num_triples:
-        :return:
-        """
         entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
 
         for i, domain_i in enumerate(co_occurrences):
@@ -574,9 +650,7 @@ class Parser:
                 pass
             break
 
-#            compare i with K^2 terms
-
-
+        #            compare i with K^2 terms
 
         exit(1)
         import networkx as nx
@@ -585,16 +659,14 @@ class Parser:
         entropies, co_occurrences = self.calculate_entropies(freq_adj_matrix, num_triples)
         del co_occurrences
 
-
         row = list()
         col = list()
         data = list()
 
         num_of_unqiue_entities = len(freq_adj_matrix)
         for i, co_info in freq_adj_matrix.items():
-
-            j=list(co_info.keys())
-            vals=np.array(list(co_info.values()))
+            j = list(co_info.keys())
+            vals = np.array(list(co_info.values()))
 
             row.extend(np.array([i] * len(j)))
 
@@ -602,46 +674,22 @@ class Parser:
 
             data.extend(entropies[vals])
 
-        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)), shape=(num_of_unqiue_entities, num_of_unqiue_entities))
-
+        entropy_adj_matirx = sparse.csc_matrix((data, (row, col)),
+                                               shape=(num_of_unqiue_entities, num_of_unqiue_entities))
 
         G = nx.from_scipy_sparse_matrix(entropy_adj_matirx)
-        #del entropy_adj_matirx
- #       k_components = approximation.min_maximal_matching(G)
-#        print(k_components)
-        #print(list(nx.dfs_predecessors(G, source=3)))
-        #https://networkx.github.io/documentation/stable/reference/algorithms/generated/networkx.algorithms.approximation.connectivity.local_node_connectivity.html#networkx.algorithms.approximation.connectivity.local_node_connectivity
+        # del entropy_adj_matirx
+        #       k_components = approximation.min_maximal_matching(G)
+        #        print(k_components)
+        # print(list(nx.dfs_predecessors(G, source=3)))
+        # https://networkx.github.io/documentation/stable/reference/algorithms/generated/networkx.algorithms.approximation.connectivity.local_node_connectivity.html#networkx.algorithms.approximation.connectivity.local_node_connectivity
 
-
-        l=np.array(MiniBatchKMeans(n_clusters=10).fit(entropy_adj_matirx).labels_)
+        l = np.array(MiniBatchKMeans(n_clusters=10).fit(entropy_adj_matirx).labels_)
         print(l)
         exit(1)
         pass
-
-    def construct_entitiy_adj_matrix_from_list(self,kb:typing.List[Tuple[str,str,str]]):
-
-        num_of_rdf=len(kb)
-        binary_adj_matrix = {}
-        vocabulary = {}
-        entities_to_indexes = {}
-
-        for s, p, o in kb:
-            # mapping from string to vocabulary
-            vocabulary.setdefault(s, len(vocabulary))
-            entities_to_indexes[s] = vocabulary[s]
-
-
-            vocabulary.setdefault(o, len(vocabulary))
-            entities_to_indexes[o] = vocabulary[o]
-
-            binary_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[o]] += 1
-            binary_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[s]] += 1
-
-
-        holder = self.similarity_function(binary_adj_matrix, num_of_rdf)
-
-
-        return holder
+    
+    """
 
 
     def get_path_knowledge_graphs(self, path: str):
@@ -657,7 +705,7 @@ class Parser:
         else:
             for root, dir, files in os.walk(path):
                 for file in files:
-                    print(file)
+                    # print(file)
                     if '.nq' in file or '.nt' in file or 'ttl' in file:
                         KGs.append(path + '/' + file)
         if len(KGs) == 0:
@@ -681,16 +729,12 @@ class Parser:
             del components[-1]
             s, p, o = components
 
+
             flag = 4
 
         elif len(components) == 3:
             s, p, o = components
             flag = 3
-
-            # if '"' in sentence:
-            #    remaining = sentence[len(s) + len(p) + 5:]
-            #    literal = remaining[1:remaining.index(' <http://')]
-            #    o = literal
 
         elif len(components) > 4:
 
@@ -704,215 +748,29 @@ class Parser:
 
             ## This means that literal contained in RDF triple contains < > symbol
             """ pass"""
-            flag = 0
             # print(sentence)
             raise ValueError()
 
-        # o = re.sub("\s+", "", o)
+        o = re.sub("\s+", "", o)
 
-        # s = re.sub("\s+", "", s)
+        s = re.sub("\s+", "", s)
 
-        # p = re.sub("\s+", "", p)
+        p = re.sub("\s+", "", p)
 
         return s, p, o, flag
 
-    @performance_debugger('Parse RDF triples to co occurrence matrix')
-    def create_dic_from_text(self, f_name: str, bound: int):
-        """
+    @performance_debugger('KG to PPMI Matrix')
+    def construct_adj_sobol(self, f_name, bound=10):
 
-        :param f_name: path of a KG or of a folder containg KGs
-        :param bound: number of RDF triples for a KG.
-        :return:
-        """
+        freq_adj_matrix, num_of_rdf = self.process_file(f_name, bound)
+        # freq_adj_matrix, num_of_rdf = self.process_file_with_node(f_name, bound)
 
-        binary_co_occurence_matrix = {}
-        vocabulary = {}
-        subjects_to_indexes = {}
-        predicates_to_indexes = {}
+        ut.serializer(object_=freq_adj_matrix, path=self.p_folder, serialized_name='freq_adj_matrix')
 
-        num_of_rdf = 0
-
-        p_knowledge_graphs = self.get_path_knowledge_graphs(f_name)
-
-        writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
-
-        for f_name in p_knowledge_graphs:
-
-            if f_name[-4:] == '.bz2':
-                reader = BZ2File(f_name, "r")
-            else:
-                reader = open(f_name, "r")
-
-            total_sentence = 0
-
-            for sentence in reader:
-                if isinstance(sentence, bytes):
-                    sentence = sentence.decode('utf-8')
-                #                    sentence = sentence.decode('ascii')
-
-                if total_sentence == bound: break
-
-                #             if ('rdf-schema#' in sentence) or ('description' in sentence):
-                #                  pass
-                #               else:
-                #                    continue
-
-                #                if '"' in sentence:
-                #                   continue
-
-                try:
-                    s, p, o, flag = self.decompose_rdf(sentence)
-
-                    if not ((flag == 4) or (flag == 3) or (flag == 2)):
-                        print(sentence)
-                    #    print('exitting')
-                    #   continue
-
-                except ValueError:
-                    continue
-
-                total_sentence += 1
-
-                #                processed_triples = '<' + s + '> ' + '<' + p + '> ' + '<' + o + '> .\n'
-                #               writer_kb.write(processed_triples)
-                writer_kb.write(sentence)
-                # Replace each next line character with space.
-                # writer_kb.write(re.sub("<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3> .", ".", sentence))
-
-                # mapping from string to vocabulary
-                vocabulary.setdefault(s, len(vocabulary))
-                subjects_to_indexes[s] = vocabulary[s]
-
-                vocabulary.setdefault(p, len(vocabulary))
-                predicates_to_indexes[p] = vocabulary[p]
-
-                vocabulary.setdefault(o, len(vocabulary))
-
-                binary_co_occurence_matrix.setdefault(vocabulary[s], []).append(vocabulary[p])
-                binary_co_occurence_matrix[vocabulary[s]].append(vocabulary[o])
-
-                binary_co_occurence_matrix.setdefault(vocabulary[p], []).append(vocabulary[s])
-                binary_co_occurence_matrix[vocabulary[p]].append(vocabulary[o])
-
-                binary_co_occurence_matrix.setdefault(vocabulary[o], []).append(vocabulary[s])
-                binary_co_occurence_matrix[vocabulary[o]].append(vocabulary[p])
-
-            reader.close()
-            num_of_rdf += total_sentence
-
-        writer_kb.close()
-        assert len(vocabulary) == len(binary_co_occurence_matrix)
-
-        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes, predicates_to_indexes
-
-    def create_dic_from_text_all(self, f_name):
-
-        background_knowledge = list()
-        binary_co_occurence_matrix = {}
-
-        KGs = list()
-        vocabulary = dict()
-        subjects_to_indexes = dict()
-
-        if os.path.isfile(f_name):
-            KGs.append(f_name)
-        else:
-            for root, dir, files in os.walk(f_name):
-                for file in files:
-                    if '.nq' in file or '.nt' in file:
-                        KGs.append(f_name + '/' + file)
-
-        try:
-            assert len(KGs) > 0
-        except (FileNotFoundError, IOError):
-            print(f_name + '  does not contain any .nq or .nt file file containing')
-
-        for f_name in KGs:
-            # print('File name ',f_name)
-            with open(f_name, "r") as reader:
-
-                for sentence in reader:
-
-                    components = re.findall('<(.+?)>', sentence)
-
-                    if len(components) == 4:
-                        del components[-1]
-                        s, p, o = components
-                    elif len(components) < 4:
-                        s, p, o = components
-                    else:
-                        """ pass"""
-                        print(sentence)
-                        del sentence
-
-                    processed_rdf = '<' + s + '> ' + '<' + p + '> ' + '<' + p + '> .'
-                    background_knowledge.append(processed_rdf)
-
-                    """
-                    background_knowledge.append(sentence)
-
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.drugbank.R3>', '',
-                                             1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/drugbank_resource:bio2rdf.dataset.sider.R3>', '', 1)
-                    sentence = self.rreplace(sentence, '<http://bio2rdf.org/sider_resource:bio2rdf.dataset.sider.R4>',
-                                             '', 1)
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/wormbase_resource:bio2rdf.dataset.wormbase.R4>', '',
-                                             1)
-
-                    sentence = self.rreplace(sentence,
-                                             '<http://bio2rdf.org/pubmed_resource:bio2rdf.dataset.pubmed.R3.statistic>',
-                                             '',
-                                             1)
-
-                    s = sentence[:sentence.find('>') + 1]
-                    sentence = sentence[len(s) + 1:]
-                    p = sentence[:sentence.find('>') + 1]
-                    o = sentence[len(p) + 1:]
-
-                    s = self.modifier(s)
-                    p = self.modifier(p)
-                    o = self.modifier(o)
-                    
-                    """
-
-                    # mapping from string to vocabulary
-                    vocabulary.setdefault(s, len(vocabulary))
-                    subjects_to_indexes[s] = vocabulary[s]
-
-                    vocabulary.setdefault(p, len(vocabulary))
-                    vocabulary.setdefault(o, len(vocabulary))
-                    # subjects_to_indexes.setdefault(o, len(vocabulary) - 1)
-
-                    binary_co_occurence_matrix.setdefault(vocabulary[s], []).append(vocabulary[p])
-                    binary_co_occurence_matrix[vocabulary[s]].append(vocabulary[o])
-
-                    binary_co_occurence_matrix.setdefault(vocabulary[p], []).append(vocabulary[s])
-                    binary_co_occurence_matrix[vocabulary[p]].append(vocabulary[o])
-
-                    binary_co_occurence_matrix.setdefault(vocabulary[o], []).append(vocabulary[s])
-                    binary_co_occurence_matrix[vocabulary[o]].append(vocabulary[p])
-
-            reader.close()
-
-        f_name = 'KG' + '/' + 'KB.txt'
-
-        with open(f_name, 'w') as handle:
-            for sentence in background_knowledge:
-                handle.write(sentence)
-        handle.close()
-
-        num_of_rdf = len(background_knowledge)
-        del background_knowledge
-
-        assert len(binary_co_occurence_matrix) > 0
-
-        return binary_co_occurence_matrix, vocabulary, num_of_rdf, subjects_to_indexes
+        return num_of_rdf
 
     @performance_debugger('KG to PPMI Matrix')
-    def construct_comatrix(self, f_name, bound=''):
+    def construct_adj_matrix(self, f_name, bound=''):
 
         if isinstance(bound, int):
             freq_matrix, vocab, num_triples, subjects_to_indexes, predicates_to_indexes = self.create_dic_from_text(
@@ -920,52 +778,41 @@ class Parser:
         else:
             freq_matrix, vocab, num_triples, only_resources = self.create_dic_from_text_all(f_name)
 
-        print(vocab)
-        print(sys.getsizeof(freq_matrix) / 1000000)
-        exit(1)
-        string_vocab = np.array(list(vocab.keys()))
+        print('Size of vocabulary', len(vocab))
+        print('Number of RDF triples', num_triples)
+        print('Number of subjects', len(subjects_to_indexes))
+
         indexes_of_subjects = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
         indexes_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
 
         # Prune those subject that occurred in predicate position
-        indexes_of_valid_subjects = np.setdiff1d(indexes_of_subjects, indexes_of_predicates)
-        del indexes_of_subjects
-        del indexes_of_predicates
-
-        valid_subjects = string_vocab[indexes_of_valid_subjects]
-        ut.serializer(object_=valid_subjects, path=self.p_folder, serialized_name='subjects')
-
-        num_subjects = len(subjects_to_indexes)
-        del subjects_to_indexes
-
-        print('Number of valid subjects for DL-Learner', len(indexes_of_valid_subjects))
-        print('Size of vocabulary', len(vocab))
-        print('Number of RDF triples', num_triples)
-        print('Number of subjects', num_subjects)
-        print('Number of predicates', len(predicates_to_indexes))
-
-        Saver.settings.append("Size of vocabulary:" + str(len(vocab)))
-        Saver.settings.append("Number of RDF triples:" + str(num_triples))
-        Saver.settings.append("Number of subjects:" + str(num_subjects))
-        Saver.settings.append("Number of predicates:" + str(len(predicates_to_indexes)))
-        Saver.settings.append("Number of valid subjects for DL-Learner:" + str(indexes_of_valid_subjects))
-        del vocab
-
-        ut.serializer(object_=indexes_of_valid_subjects, path=self.p_folder,
-                      serialized_name='indexes_of_valid_subjects')
-        del indexes_of_valid_subjects
+        valid_subjects = np.setdiff1d(indexes_of_subjects, indexes_of_predicates)
+        print('Number of valid subjects for DL-Learner', len(valid_subjects))
 
         texec = ThreadPoolExecutor(4)
         future = texec.submit(self.similarity_function, freq_matrix, num_triples)
 
-        del freq_matrix
+        ut.serializer(object_=dict(zip(list(vocab.values()), list(vocab.keys()))), path=self.p_folder,
+                      serialized_name='i_vocab')
 
-        f = future.result()
+        ut.serializer(object_=vocab, path=self.p_folder, serialized_name='vocab')
+        del vocab
 
-        top_k_sim = f[0]
-        negatives = f[1]
+        index_of_predicates = np.array(list(predicates_to_indexes.values()), dtype=np.uint32)
+        ut.serializer(object_=index_of_predicates, path=self.p_folder, serialized_name='index_of_predicates')
+        del predicates_to_indexes
+        del index_of_predicates
 
-        return top_k_sim, negatives
+        index_of_resources = np.array(list(subjects_to_indexes.values()), dtype=np.uint32)
+        ut.serializer(object_=index_of_resources, path=self.p_folder, serialized_name='index_of_resources')
+        del index_of_resources
+
+        ut.serializer(object_=subjects_to_indexes, path=self.p_folder, serialized_name='subjects_to_indexes')
+        del subjects_to_indexes
+
+        similarities = future.result()
+
+        return similarities
 
     @performance_debugger('KG to PPMI Matrix')
     def construct(self, f_name, bound=''):
@@ -1012,8 +859,8 @@ class Parser:
 
         return similarities
 
-    @performance_debugger('Choose K attractives')
-    def choose_to_K_attractive_entities(self, co_similarity_matrix, size_of_iteracting_entities):
+    @performance_debugger('Choose K attractives and repulsives')
+    def choose_to_K_attract_repulsives(self, similarities):
         """
 
         :param co_similarity_matrix:
@@ -1021,13 +868,24 @@ class Parser:
         :return:
         """
 
-        for k, v in co_similarity_matrix.items():
-            if len(v) > size_of_iteracting_entities:
-                co_similarity_matrix[k] = dict(
-                    sorted(v.items(), key=lambda kv: kv[1], reverse=True)[0:size_of_iteracting_entities])
+        holder = list()
+
+        for k, v in similarities.items():
+
+            if len(v) > self.K:
+                _ = sorted(v.items(), key=lambda kv: kv[1], reverse=True)[0:self.K]
+
             else:
-                co_similarity_matrix[k] = dict(sorted(v.items(), key=lambda kv: kv[1], reverse=True))
-        return co_similarity_matrix
+                _ = sorted(v.items(), key=lambda kv: kv[1], reverse=True)
+
+            l = list(itertools.chain.from_iterable(_))
+            context = np.array(l[::2], dtype=np.uint32)
+            sims = np.array(l[1::2], dtype=np.float32)
+            sims.shape = (sims.size, 1)
+
+            holder.append((context, sims, np.random.choice(len(similarities), self.K, )))
+
+        return holder
 
     def random_sample_repulsive_entities(self, ppmi_co_occurence_matrix, num_interacting_entities):
 
@@ -1047,20 +905,9 @@ class Parser:
 
         return return_val
 
-    @performance_debugger('Assigning attractive and repulsive particles')
-    def get_attractive_repulsive_entities(self, stats_corpus_info, K):
-        pruned_stats_corpus_info = self.choose_to_K_attractive_entities(stats_corpus_info, K)
-        attractives = list(pruned_stats_corpus_info.values())
-        del pruned_stats_corpus_info
 
-        repulsive_entities = self.random_sample_repulsive_entities(stats_corpus_info, K)
-
-        ut.serializer(object_=repulsive_entities, path=self.p_folder, serialized_name='Negative_URIs')
-        ut.serializer(object_=attractives, path=self.p_folder, serialized_name='Positive_URIs')
-
-        return attractives, repulsive_entities
-
-    def apply_ppmi_on_entitiy_adj_matrix(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> typing.Tuple[dict,dict]:
+    def apply_ppmi_on_entitiy_adj_matrix(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> \
+            typing.Tuple[dict, dict]:
         """
 
         :param freq_adj_matrix: is mapping from the index of entities to Counter object.
@@ -1073,8 +920,6 @@ class Parser:
                                   dtype=np.uint32) / num_triples
 
         holder = list()
-
-
 
         for unq_ent, contexts_w_co_freq in freq_adj_matrix.items():
             top_k_sim = dict()
@@ -1122,41 +967,174 @@ class Parser:
 
         return holder
 
-    @performance_debugger('Constructing entitiy adj matrix')
+    @performance_debugger('Assigning attractive and repulsive particles')
+    def get_attractive_repulsive_entities(self, similarities: typing.Sequence[typing.Dict[int, np.float64]]):
+        """
+
+        :param similarities: typing.Sequence corresponds to a numpy array
+        :return:
+        """
+
+
+        holder = list()
+
+        for k, v in enumerate(similarities):
+
+            if len(v) > self.K:
+                _ = sorted(v.items(), key=lambda kv: kv[1], reverse=True)[0:self.K]
+
+            else:
+                _ = sorted(v.items(), key=lambda kv: kv[1], reverse=True)
+
+            l = list(itertools.chain.from_iterable(_))
+
+            context = np.array(l[::2], dtype=np.uint32)
+            sims = np.array(l[1::2], dtype=np.float32)
+            sims.shape = (sims.size, 1)
+
+            # sampled may contain dublicated variables
+            sampled = np.random.choice(len(similarities), self.K)
+
+            # negatives must be disjoint from context of k.th vocabulary term and k.term itsel
+            negatives = np.setdiff1d(sampled, np.append(context, k), assume_unique=True)
+
+            holder.append((context, sims, negatives))
+
+        # numpy array requires more memory, sys.getsizeof(holder)<sys.getsizeof(np.array(holder))
+        return holder
+
+    @performance_debugger('Preprocessing')
     def pipeline_of_preprocessing(self, f_name, bound=''):
-        vocabulary = None
-        freq_adj_matrix = None
-        num_of_rdf = None
-        index_to_valid_sub=None
 
-        # Todo IDEA, do not save valid indexes but while reading write into file
-
-        if isinstance(bound, int):
-            freq_adj_matrix, vocabulary, num_of_rdf, index_to_valid_sub = self.process_file(f_name, bound)
-
+        inverted_index, num_of_rdf, similar_characteristics = self.inverted_index(f_name, bound)
+        exit(1)
+        if 'helper_classes.WeightedJaccard' in repr(self.similarity_measurer):
+            similarities = self.similarity_measurer(similar_characteristics, self.p_folder).get_similarities(
+                inverted_index, num_of_rdf)
         else:
-            print('not yet implemented')
-            exit(1)
+            holder = self.similarity_measurer().get_similarities(inverted_index, num_of_rdf,self.K)
 
 
-        ut.serializer(object_=np.array(list(index_to_valid_sub.keys()),dtype=np.uint32), path=self.p_folder, serialized_name='indexes_of_valid_subjects')
-        ut.serializer(object_=list(index_to_valid_sub.values()), path=self.p_folder, serialized_name='subjects')
-
-        del index_to_valid_sub
-
-        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
-        del vocabulary
-
-        holder = self.similarity_function(freq_adj_matrix, num_of_rdf)
-
+#        holder = self.get_attractive_repulsive_entities(similarities)
 
         return holder
+
+    @performance_debugger('Preprocessing')
+    def process_KB_w_Sobol(self, f_name, bound=''):
+
+        inverted_index, num_of_rdf, _ = self.inverted_index(f_name, bound)
+
+        ut.serializer(object_=inverted_index,path=self.p_folder,serialized_name='inverted_index')
+
+        return num_of_rdf
+
     def process_file(self, path, bound):
 
         freq_adj_matrix = {}
         vocabulary = {}
         num_of_rdf = 0
-        i_vocab=dict()
+        index_to_prune_for_dl = dict()
+        p_knowledge_graphs = self.get_path_knowledge_graphs(path)
+
+        writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
+
+        for f_name in p_knowledge_graphs:
+
+            if f_name[-4:] == '.bz2':
+                reader = bz2.open(f_name, "rt")
+
+
+
+            else:
+                reader = open(f_name, "r")
+
+            total_sentence = 0
+
+            counter = 0
+            for sentence in reader:
+                if isinstance(sentence, bytes):
+                    sentence = sentence.decode('utf-8')
+                    print('asdad')
+                    exit(1)
+
+                # print(sentence)
+                if total_sentence == bound: break
+
+                counter += 1
+
+                if '"' in sentence or "'" in sentence:
+                    continue
+
+                # if 'rdf-syntax-ns#type' in sentence:
+                #     continue
+
+                writer_kb.write(sentence)
+
+                if counter % 100000 == 0:
+                    print(counter)
+                try:
+                    s, p, o, flag = self.decompose_rdf(sentence)
+
+                    # <..> <..> <..>
+                    if flag != 3:
+                        print(sentence)
+                        print(flag)
+                        continue
+
+                except ValueError:
+                    continue
+                total_sentence += 1
+
+                writer_kb.write(sentence)
+
+                # mapping from string to vocabulary
+                vocabulary.setdefault(s, len(vocabulary))
+                vocabulary.setdefault(p, len(vocabulary))
+                vocabulary.setdefault(o, len(vocabulary))
+
+                index_to_prune_for_dl[vocabulary[p]] = p
+                index_to_prune_for_dl[vocabulary[o]] = o
+
+                freq_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[o]] += 1
+                freq_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[p]] += 1
+
+                freq_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[s]] += 1
+                freq_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[p]] += 1
+
+                freq_adj_matrix.setdefault(vocabulary[p], Counter())[vocabulary[s]] += 1
+                freq_adj_matrix.setdefault(vocabulary[p], Counter())[vocabulary[p]] += 1
+
+            print(f_name, ' - ', counter)
+            reader.close()
+            num_of_rdf += total_sentence
+
+        writer_kb.close()
+
+        print('Number of RDF triples in the input KG:', num_of_rdf)
+        print('Number of entities:', len(vocabulary) - len(index_to_prune_for_dl))
+
+        if len(vocabulary) == 0:
+            print('exitting')
+            exit(1)
+
+        print(freq_adj_matrix[0])
+
+        exit(1)
+
+        ut.serializer(object_=index_to_prune_for_dl, path=self.p_folder, serialized_name='index_to_prune_for_dl')
+        del index_to_prune_for_dl
+
+        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
+        del vocabulary
+
+        return freq_adj_matrix, num_of_rdf
+
+    def process_file_with_node(self, path, bound):
+
+        freq_adj_matrix = {}
+        vocabulary = {}
+        num_of_rdf = 0
+        index_to_prune_for_dl = dict()
         p_knowledge_graphs = self.get_path_knowledge_graphs(path)
 
         writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
@@ -1176,13 +1154,14 @@ class Parser:
 
                 if total_sentence == bound: break
 
-                try:
-                    s, p, o, flag = self.decompose_rdf(sentence)
+                if '"' in sentence:
+                    continue
 
-                    if flag != 3:
-                        # print(sentence)
-                        continue
+                try:
+
+                    s, p, o, _ = sentence.split(' ')
                 except ValueError:
+                    print('val error')
                     continue
                 total_sentence += 1
 
@@ -1190,32 +1169,206 @@ class Parser:
 
                 # mapping from string to vocabulary
                 vocabulary.setdefault(s, len(vocabulary))
-                # entities_to_indexes[s] = vocabulary[s]
-                i_vocab.setdefault(len(vocabulary),s)
-
-                # vocabulary.setdefault(p, len(vocabulary))
-
+                vocabulary.setdefault(p, len(vocabulary))
                 vocabulary.setdefault(o, len(vocabulary))
-                # entities_to_indexes[o] = vocabulary[o]
+
+                index_to_prune_for_dl[vocabulary[p]] = p
+
+                if 'owl#' in o:
+                    index_to_prune_for_dl[vocabulary[o]] = o
+                    index_to_prune_for_dl[vocabulary[s]] = s
+
+                if 'ontology' in o:
+                    index_to_prune_for_dl[vocabulary[o]] = o
+                    index_to_prune_for_dl[vocabulary[s]] = s
+
+                if 'http://www.w3.org/2000/01/rdf-schema#subClassOf' in p:
+                    index_to_prune_for_dl[vocabulary[o]] = o
+                    index_to_prune_for_dl[vocabulary[s]] = s
 
                 freq_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[o]] += 1
+                freq_adj_matrix.setdefault(vocabulary[s], Counter())[vocabulary[p]] += 1
+
                 freq_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[s]] += 1
+                freq_adj_matrix.setdefault(vocabulary[o], Counter())[vocabulary[p]] += 1
+
+                freq_adj_matrix.setdefault(vocabulary[p], Counter())[vocabulary[s]] += 1
+                freq_adj_matrix.setdefault(vocabulary[p], Counter())[vocabulary[p]] += 1
 
             reader.close()
             num_of_rdf += total_sentence
 
         writer_kb.close()
-        # TODO think later bout predicates
+
         print('Number of RDF triples in the input KG:', num_of_rdf)
         print('Number of entities:', len(vocabulary))
 
-        return freq_adj_matrix, vocabulary, num_of_rdf,i_vocab
+        if len(vocabulary) == 0:
+            print('exitting')
+            exit(1)
 
+        ut.serializer(object_=index_to_prune_for_dl, path=self.p_folder, serialized_name='index_to_prune_for_dl')
+        del index_to_prune_for_dl
+
+        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
+        del vocabulary
+
+        return freq_adj_matrix, num_of_rdf
+
+    def read_kb(self, path, bound):
+
+        co_occurrences = {}
+        vocabulary = {}
+        num_of_rdf = 0
+        index_to_prune_for_dl = dict()
+        p_knowledge_graphs = self.get_path_knowledge_graphs(path)
+
+        writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
+
+        for f_name in p_knowledge_graphs:
+
+            if f_name[-4:] == '.bz2':
+                reader = bz2.open(f_name, "rt")
+
+            else:
+                reader = open(f_name, "r")
+
+            total_sentence = 0
+
+            counter = 0
+            for sentence in reader:
+
+                # print(sentence)
+                if total_sentence == bound: break
+
+                counter += 1
+
+                if '"' in sentence or "'" in sentence:
+                    continue
+
+                writer_kb.write(sentence)
+
+                if counter % 100000 == 0:
+                    print(counter)
+                try:
+                    s, p, o, flag = self.decompose_rdf(sentence)
+
+                    # <..> <..> <..>
+                    if flag != 3:
+                        print(sentence)
+                        print(flag)
+                        continue
+
+                except ValueError:
+                    continue
+                total_sentence += 1
+
+                # mapping from string to vocabulary
+                vocabulary.setdefault(s, len(vocabulary))
+                vocabulary.setdefault(p, len(vocabulary))
+                vocabulary.setdefault(o, len(vocabulary))
+
+                index_to_prune_for_dl[vocabulary[p]] = p
+                index_to_prune_for_dl[vocabulary[o]] = o
+
+                co_occurrences.setdefault(vocabulary[s], []).append(vocabulary[p])
+                co_occurrences[vocabulary[s]].append(vocabulary[o])
+
+                co_occurrences.setdefault(vocabulary[p], []).append(vocabulary[s])
+                co_occurrences[vocabulary[p]].append(vocabulary[o])
+
+                co_occurrences.setdefault(vocabulary[o], []).append(vocabulary[s])
+                # co_occurrences[vocabulary[o]].append(vocabulary[p])
+
+            print(f_name, ' - ', counter)
+            reader.close()
+            num_of_rdf += total_sentence
+
+        writer_kb.close()
+
+        print('Number of RDF triples in the input KG:', num_of_rdf)
+        print('Number of entities:', len(vocabulary) - len(index_to_prune_for_dl))
+
+        if len(vocabulary) == 0:
+            print('exitting')
+            exit(1)
+
+        print(co_occurrences)
+        exit(1)
+        ut.serializer(object_=index_to_prune_for_dl, path=self.p_folder, serialized_name='index_to_prune_for_dl')
+        del index_to_prune_for_dl
+
+        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
+        del vocabulary
+
+        return co_occurrences, num_of_rdf
+
+    @performance_debugger('Constructing Inverted Index')
+    def inverted_index(self, path, bound):
+
+        inverted_index = {}
+        vocabulary = {}
+        similar_characteristics = defaultdict(lambda: defaultdict(list))
+
+        num_of_rdf = 0
+        writer_kb = open(self.p_folder + '/' + 'KB.txt', 'w')
+
+        type_info = defaultdict(set)
+
+        sentences = ut.generator_of_reader(bound, self.get_path_knowledge_graphs(path), self.decompose_rdf)
+
+        for s, p, o in sentences:
+
+            num_of_rdf += 1
+#            writer_kb.write(s + ' ' + p + ' ' + o + ' .\n')
+            writer_kb.write(s + ' ' + p + ' ' + o + ' .\n')
+
+            # mapping from string to vocabulary
+            vocabulary.setdefault(s, len(vocabulary))
+            vocabulary.setdefault(p, len(vocabulary))
+            vocabulary.setdefault(o, len(vocabulary))
+
+            inverted_index.setdefault(vocabulary[s], []).extend([vocabulary[o], vocabulary[p]])
+            inverted_index.setdefault(vocabulary[p], []).extend([vocabulary[s], vocabulary[o]])
+            inverted_index.setdefault(vocabulary[o], []).extend([vocabulary[s], vocabulary[p]])
+
+            if 'rdf-syntax-ns#type' in p:
+                type_info[vocabulary[s]].add(vocabulary[o])
+
+
+        print('Number of RDF triples:', num_of_rdf)
+        print('Number of vocabulary terms: ', len(vocabulary))
+        print('Number of subjects: ', len(type_info))
+
+        Saver.settings.append('Number of RDF triples:' + str(num_of_rdf))
+        Saver.settings.append('Number of subjects:' + str(len(type_info)))
+        Saver.settings.append('Number of vocabulary terms: ' + str(len(vocabulary)))
+
+        #writer_kb.close()
+        # This command ensures that inverted index starts from 0 to the size of vocabulary.
+        # If this always true, we do not need to store key values.
+        assert list(inverted_index.keys()) == list(range(0, len(vocabulary)))
+
+        vocabulary = list(vocabulary.keys())
+        ut.serializer(object_=vocabulary, path=self.p_folder, serialized_name='vocabulary')
+        del vocabulary
+
+        #        inverted_index = np.array(list(inverted_index.values()))
+        inverted_index = list(inverted_index.values())
+
+        ut.serializer(object_=inverted_index, path=self.p_folder, serialized_name='inverted_index')
+
+        ut.serializer(object_=type_info, path=self.p_folder, serialized_name='type_info')
+        del type_info
+
+        print('Exitting')
+        exit(1)
+        return inverted_index, num_of_rdf, similar_characteristics
 
 class PL2VEC(object):
     def __init__(self, system_energy=1):
 
-        self.epsilon = 0.001
+        self.epsilon = 0.1
         self.texec = ThreadPoolExecutor(8)
 
         self.total_distance_from_attractives = list()
@@ -1223,45 +1376,52 @@ class PL2VEC(object):
         self.ratio = list()
         self.system_energy = system_energy
 
-
     @staticmethod
     def apply_hooke_s_law(embedding_space, target_index, context_indexes, PMS):
 
         dist = embedding_space[context_indexes] - embedding_space[target_index]
+        # replace all zeros to 1
+        dist[dist == 0] = 1
+        # replace all
         pull = dist * PMS
-        return np.sum(pull, axis=0), np.linalg.norm(dist)
+        total_pull = np.sum(pull, axis=0)
+
+        norm_of_dist = np.nan_to_num(np.linalg.norm(dist))
+
+        return total_pull, norm_of_dist
 
     @staticmethod
     def apply_coulomb_s_law(embedding_space, target_index, repulsive_indexes, negative_constant):
         # calculate distance from target to repulsive entities
-        dist = np.abs(embedding_space[repulsive_indexes] - embedding_space[target_index])
-        #        dist = np.ma.array(dist, mask=np.isnan(dist))  # Use a mask to mark the NaNs
-        #        dist=(dist ** 2).filled(np.maxi)
+        dist = embedding_space[repulsive_indexes] - embedding_space[target_index]
 
+        # replace all zeros to 1
+        dist[dist == 0] = 1
         with warnings.catch_warnings():
             try:
-                r_square = (dist ** 2) + 1
-            except RuntimeWarning:
-                print(dist)
-                print('Overflow')
-                #                r_square = dist + 0.5
-                # print(r_square)
+                #                r_square = dist ** 2
+                #               total_push = np.sum((negative_constant / r_square), axis=0)
+
+                total_push = negative_constant * np.reciprocal(dist).sum(axis=0)
+                # replace all zeros to 1
+                total_push[total_push == 0] = 1
+
+
+            except RuntimeWarning as r:
+                print(r)
+                print("Unexpected error:", sys.exc_info()[0])
+
                 exit(1)
 
-        with warnings.catch_warnings():
-            try:
-                total_push = np.sum((negative_constant / (r_square)), axis=0)
-            except RuntimeWarning:
-                print(r_square)
-                exit(1)
+        norm_of_dist = np.nan_to_num(np.linalg.norm(dist))
 
-        return total_push, np.linalg.norm(dist)
+        return total_push, norm_of_dist
 
-    def go_through_entities(self, e, holder, negative_constant, system_energy):
+    def go_through_entities(self, e, holder, negative_constant):
 
         agg_att_d = 0
         agg_rep_d = 0
-        # futures = []
+
         for target_index in range(len(e)):
             indexes_of_attractive, pms_of_contest, indexes_of_repulsive = holder[target_index]
 
@@ -1276,35 +1436,43 @@ class PL2VEC(object):
             push, abs_rep_dist = results[1]
             """
 
-            total_effect = (pull + push) * system_energy
+            total_effect = (pull + push) * self.system_energy
 
             e[target_index] = e[target_index] + total_effect
 
             agg_att_d += abs_att_dost
             agg_rep_d += abs_rep_dist
 
-        return e, 0  # agg_att_d / agg_rep_d
+        ratio = agg_att_d / agg_rep_d
+
+        return e, ratio
 
     @performance_debugger('Generating Embeddings:')
     def pipeline_of_learning_embeddings(self, *, e, max_iteration, energy_release_at_epoch, holder, negative_constant):
-        scaler = MinMaxScaler()
 
         for epoch in range(max_iteration):
             print('EPOCH: ', epoch)
 
             previous_f_norm = LA.norm(e, 'fro')
 
-            e, d_ratio = self.go_through_entities(e, holder, negative_constant, self.system_energy)
+            e, d_ratio = self.go_through_entities(e, holder, negative_constant)
 
             self.system_energy = self.system_energy - energy_release_at_epoch
-            # self.ratio.append(d_ratio)
 
-            # e[np.isnan(np.inf)] = e.max()
+            # replace nan with zero and inf with finite numbers
+            # https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.nan_to_num.html
+            # check later whether it is the chase
+            e = np.nan_to_num(e)
 
-            # Z-score
-            e = (e - e.mean()) / e.std()
-
-            #            e = scaler.fit_transform(e)
+            with warnings.catch_warnings():
+                try:
+                    e = (e - e.min(axis=0)) / (e.max(axis=0) - e.min(axis=0))
+                except RuntimeWarning as r:
+                    print(r)
+                    print(e.mean())
+                    print(np.isnan(e).any())
+                    print(np.isinf(e).any())
+                    exit(1)
 
             new_f_norm = LA.norm(e, 'fro')
 
@@ -1314,18 +1482,24 @@ class PL2VEC(object):
         return e
 
     def equilibrium(self, epoch, p_n, n_n, d_ratio):
+
         val = np.abs(p_n - n_n)
+        print('The norm diff in E', val)
+        print('d(Similars)/d(Non Similars) ', d_ratio)
         # or d_ratio < 0.1
-        if val < self.epsilon:  # or np.isnan(val) or system_energy < 0.001:
+        if val < self.epsilon or self.system_energy <= 0:  # or np.isnan(val) or system_energy < 0.001:
             print("\n Epoch: ", epoch)
             print('Previous norm', p_n)
             print('New norm', n_n)
             print('The differences in matrix norm ', val)
             print('d(Semantically Similar)/d(Not Semantically Similar) ', d_ratio)
+            print('System energy:', self.system_energy)
+
             Saver.settings.append('Epoch: ' + str(epoch))
             Saver.settings.append('The differences in matrix norm: ' + str(val))
             Saver.settings.append('Ratio of total Attractive / repulsives: ' + str(d_ratio))
-            print('The state of equilibrium is reached.')
+            Saver.settings.append('self.system_energy: ' + str(self.system_energy))
+            # print('The state of equilibrium is reached.')
             return True
         return False
 
@@ -1354,7 +1528,7 @@ class DataAnalyser(object):
 
         self.execute_DL_Learner = execute_DL_Learner  # "/Users/demir/Desktop/Thesis/Project/dllearner-1.3.0/bin/cli"
         self.p_folder = p_folder
-        self.kg_path = kg_path
+        self.kg_path = self.p_folder
 
     def set_experiment_path(self, p):
         self.p_folder = p
@@ -1374,16 +1548,17 @@ class DataAnalyser(object):
             for i in dir:
                 new_path = root + '/' + i
                 for nroot, _, nfiles in os.walk(new_path):
+                    # if 'DL_OUTPUT.txt' not in nfiles:
                     configs = [c for c in nfiles if 'conf' in c]
                     dl_req.append((nroot, configs))
+
         print(dl_req)
+        print(len(dl_req))
         return dl_req
 
     def write_config(self, t):
 
         path, l = t
-        print(path)
-        print(l)
 
         assert os.path.isfile(self.execute_DL_Learner)
 
@@ -1392,6 +1567,7 @@ class DataAnalyser(object):
             n_path = path + '/' + confs
             output_of_dl.append('\n\n')
             output_of_dl.append('### ' + confs + ' starts ###')
+            print(n_path)
 
             result = subprocess.run([self.execute_DL_Learner, n_path], stdout=subprocess.PIPE, universal_newlines=True)
 
@@ -1413,8 +1589,14 @@ class DataAnalyser(object):
 
         assert os.path.isfile(self.execute_DL_Learner)
 
+        # dl_outputs=list()
+        # for setting in data:
+        #   dl_outputs.append(self.write_config(setting))
+
+        # If memory allows
         e = ProcessPoolExecutor()
         dl_outputs = list(e.map(self.write_config, data))
+
         return dl_outputs
 
     def extract_info_from_settings(self, path_settings):
@@ -1517,26 +1699,22 @@ class DataAnalyser(object):
         # Top 3 values and class expressions regarded
         self.collect_dl_output(folder_path)
 
+        import re
+        import os
+        import pandas as pd
+        import numpy as np
+
         regex_num = re.compile('[-+]?[0-9]*\.?[0-9]+')
 
-        k1 = 'Size of vocabulary :'
-        size_of_vocab = list()
-        k2 = 'Num of RDF :'
-        num_of_rdfs = list()
-        k3 = 'energy_release_at_epoch :'
-        energe_relases = list()
-        k4 = 'Negative Constant :'
+        K = list()
         NC = list()
-        k5 = 'Num of dimension in Embedding Space :'
-        embed_space = list()
-        k6 = 'Ratio of total Attractive / repulsives:'
-        ratios = list()
-        k7 = 'Generating Embeddings: took:'
-        time_emb = list()
-        k8 = 'Num of generated clusters:'
-        num_of_clusters = list()
-        k9 = '### cluster distribution##'
-        distributon_of_cluster = list()
+        energe_relases = list()
+        number_of_samples = list()
+        Epoch = list()
+        matrix_norm_diff = list()
+        ratio_of_attractive_repulsive = list()
+        runtime_of_learning_embeddings = list()
+        cluster_dist = list()
 
         folder_names = list()
         for root, dir, files in os.walk(folder_path):
@@ -1545,77 +1723,173 @@ class DataAnalyser(object):
                 for nroot, _, nfiles in os.walk(new_path):
                     folder_names.append(i)
 
-                    individual_path = nroot + '/Settings.txt'
+                    individual_path = nroot + '/Settings'
 
                     with open(individual_path, 'r') as reader:
 
                         sentences = reader.readlines()
 
                         for index, item in enumerate(sentences):
-                            if k1 in item:
+
+                            if 'K:' in item:
                                 val = ''.join(regex_num.findall(item))
-                                size_of_vocab.append(val)
+                                K.append(val)
                                 continue
 
-                            if k2 in item:
-                                val = ''.join(regex_num.findall(item))
-                                num_of_rdfs.append(val)
-                                continue
-
-                            if k3 in item:
-                                val = ''.join(regex_num.findall(item))
-
-                                energe_relases.append(val)
-                                continue
-
-                            if k4 in item:
+                            if 'Negative Constant :' in item:
                                 val = ''.join(regex_num.findall(item))
                                 NC.append(val)
                                 continue
 
-                            if k5 in item:
+                            if 'energy_release_at_epoch :' in item:
                                 val = ''.join(regex_num.findall(item))
-                                embed_space.append(val)
+                                energe_relases.append(val)
                                 continue
 
-                            if k6 in item:
+                            if 'num_sample_from_clusters :' in item:
                                 val = ''.join(regex_num.findall(item))
-                                ratios.append(val)
+                                number_of_samples.append(val)
                                 continue
 
-                            if k7 in item:
+                            if 'Epoch: ' in item:
                                 val = ''.join(regex_num.findall(item))
-                                time_emb.append(val)
+                                Epoch.append(val)
                                 continue
 
-                            if k8 in item:
+                            if 'The differences in matrix norm:' in item:
                                 val = ''.join(regex_num.findall(item))
-                                num_of_clusters.append(val)
+                                matrix_norm_diff.append(val)
                                 continue
 
-                            if k9 in item:
-                                cluster_infos = sentences[index + 1:sentences.index('#####\n')]
-
-                                distributon_of_cluster.append(''.join(cluster_infos))
+                            if 'Ratio of total Attractive / repulsives:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                ratio_of_attractive_repulsive.append(val)
                                 continue
+
+                            if 'Generating Embeddings: took:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                runtime_of_learning_embeddings.append(val)
+                                continue
+
+                            if '### cluster distribution##' in item:
+                                values = sentences[index + 1:index + 3]
+                                item = ' '.join(values)
+                                val = '-'.join(regex_num.findall(item))
+
+                                cluster_dist.append(val)
+
                     reader.close()
-
-                    assert len(energe_relases) == len(embed_space)
 
         df = pd.DataFrame(
             {
                 'names': folder_names,
-                'size of vocab': np.array(size_of_vocab, dtype=np.uint32),
-                'num of rdfs': np.array(num_of_rdfs, dtype=np.uint32),
-                'ER': np.array(energe_relases),  # , dtype=np.float32),
+                'Energy_Relase': np.array(energe_relases),  # , dtype=np.float32),
                 'negative_constant': np.array(NC, dtype=np.float32),
-                'dim': np.array(embed_space, dtype=np.float32),
-                'ratios': np.array(ratios),  # dtype=np.float32
-                'time': np.array(time_emb, dtype=np.float32),
-                'num_of_clusters': np.array(num_of_clusters)})
+                'K': np.array(K, dtype=int),
+
+                'ratios': np.array(ratio_of_attractive_repulsive),  # dtype=np.float32
+                'Runtime_of_E': np.array(runtime_of_learning_embeddings),
+
+                'Epoch': np.array(Epoch),
+                'matrix_norm_diff': np.array(matrix_norm_diff),
+                'num_of_clusters': np.array(cluster_dist)})
+
+        df.to_csv(folder_path + '/generated_data.csv')
+
+        """
+        
+        regex_num = re.compile('[-+]?[0-9]*\.?[0-9]+')
+
+        K = list()
+        NC = list()
+        energe_relases = list()
+        number_of_samples = list()
+        Epoch = list()
+        matrix_norm_diff = list()
+        ratio_of_attractive_repulsive = list()
+        runtime_of_learning_embeddings = list()
+        cluster_dist = list()
+
+        folder_names = list()
+        for root, dir, files in os.walk(folder_path):
+            for i in dir:
+                new_path = root + '/' + i
+                for nroot, _, nfiles in os.walk(new_path):
+                    folder_names.append(i)
+
+                    individual_path = nroot + '/Settings'
+
+                    with open(individual_path, 'r') as reader:
+
+                        sentences = reader.readlines()
+
+                        for index, item in enumerate(sentences):
+                            print(item)
+
+                            if 'K:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                K.append(val)
+                                continue
+
+                            if 'Negative Constant :' in item:
+                                val = ''.join(regex_num.findall(item))
+                                NC.append(val)
+                                continue
+
+                            if 'energy_release_at_epoch :' in item:
+                                val = ''.join(regex_num.findall(item))
+                                energe_relases.append(val)
+                                continue
+
+                            if 'num_sample_from_clusters :' in item:
+                                val = ''.join(regex_num.findall(item))
+                                number_of_samples.append(val)
+                                continue
+
+                            if 'Epoch: ' in item:
+                                val = ''.join(regex_num.findall(item))
+                                Epoch.append(val)
+                                continue
+
+                            if 'The differences in matrix norm:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                matrix_norm_diff.append(val)
+                                continue
+
+                            if 'Ratio of total Attractive / repulsives:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                ratio_of_attractive_repulsive.append(val)
+                                continue
+
+                            if 'Generating Embeddings: took:' in item:
+                                val = ''.join(regex_num.findall(item))
+                                runtime_of_learning_embeddings.append(val)
+                                continue
+
+                            if '### cluster distribution##' in item:
+                                values = sentences[index + 1:index + 3]
+                                cluster_dist.append('---'.join(values))
+
+                    reader.close()
+                    exit(1)
+
+        df = pd.DataFrame(
+            {
+                'names': folder_names,
+                'Energy_Relase': np.array(energe_relases),  # , dtype=np.float32),
+                'negative_constant': np.array(NC, dtype=np.float32),
+                'K': np.array(K, dtype=int),
+
+                'ratios': np.array(ratio_of_attractive_repulsive),  # dtype=np.float32
+                'Runtime_of_E': np.array(runtime_of_learning_embeddings),
+
+                'Epoch': np.array(Epoch),
+                'matrix_norm_diff': np.array(matrix_norm_diff),
+                'num_of_clusters': np.array(cluster_dist)})
 
         df.to_csv(folder_path + '/generated_data')
         return folder_path + '/generated_data'
+        """
 
     def combine_all_data(self, folder_path):
 
@@ -1650,7 +1924,7 @@ class DataAnalyser(object):
         :param folder_path:
         :return:
         """
-
+        """
         def formatter(text):
             v = re.findall('[-+]?[0-9]*\.?[0-9]+', text)
             # rank, prediction accuracy, f mesaure
@@ -1691,13 +1965,6 @@ class DataAnalyser(object):
                             print('EMPTY')
                             print(individual_path)
                             print(f_scores)
-                        """
-                        means.append(np.mean(np.array(f_scores)))
-                        std.append(np.std(np.array(f_scores)))
-                        medians.append(np.median(np.array(f_scores)))
-                        mins.append(np.min(np.array(f_scores)))
-                        maxs.append(np.max(np.array(f_scores)))
-                        """
 
         folder_names = list()
         firsts = list()
@@ -1710,6 +1977,83 @@ class DataAnalyser(object):
             seconds.append(i[2])
             thirds.append(i[3])
 
+        df = pd.DataFrame(
+            {'names': folder_names,
+             'Rank1': np.array(firsts),
+             'Rank2': np.array(seconds),
+             'Rank3': np.array(thirds),
+             })
+        df.to_csv(folder_path + '/DL_responds.csv')
+        
+        """
+
+        def formatter(text):
+
+            v = re.findall('[-+]?[0-9]*\.?[0-9]+', text)
+            # rank, prediction accuracy, f mesaure
+            return v[-1]
+            """
+            # get first and last two collumn
+
+            if len(v) == 3:
+                return float(v[-1])
+            elif len(v) == 4 or len(v) == 5:
+                # print(text)
+                # print(v)
+                # print('val to be returned',float(v[-1]))
+                return float(v[-1])
+            else:
+                print(text)
+                print(v)
+                # print(text)
+                # print(v)
+                # print(len(v))
+                print('unexpected val')
+                exit(1)
+            """
+
+        holder = list()
+        for root, dir, files in os.walk(folder_path):
+
+            for i in dir:
+                new_path = root + '/' + i
+
+                for nroot, _, nfiles in os.walk(new_path):
+
+                    # folder_names.append(i)
+                    individual_path = nroot + '/DL_OUTPUT.txt'
+
+                    with open(individual_path, 'r') as reader:
+
+                        f_scores = [formatter(item) for item in reader if '1:' in item or '2:' in item or '3:' in item]
+
+                        if f_scores:
+                            # This f scores is obtained by   only regarding top3
+                            # print(individual_path)
+                            # print(f_scores)
+                            # firsts.append(f_scores[0])
+                            # seconds.append(f_scores[1])
+                            # thirds.append(f_scores[2])
+                            holder.append((individual_path, f_scores[0], f_scores[1], f_scores[2]))
+                        else:
+                            print('EMPTY')
+                            print(individual_path)
+                            print(f_scores)
+
+                        # means.append(np.mean(np.array(f_scores)))
+                        # std.append(np.std(np.array(f_scores)))
+                        # medians.append(np.median(np.array(f_scores)))
+                        # mins.append(np.min(np.array(f_scores)))
+                        # maxs.append(np.max(np.array(f_scores)))
+        folder_names = list()
+        firsts = list()
+        seconds = list()
+        thirds = list()
+        for i in holder:
+            folder_names.append(i[0])
+            firsts.append(i[1])
+            seconds.append(i[2])
+            thirds.append(i[3])
         df = pd.DataFrame(
             {'names': folder_names,
              'Rank1': np.array(firsts),
@@ -1739,7 +2083,11 @@ class DataAnalyser(object):
             distances = list()
 
             for index, ith_vec_of_embeddings in enumerate(learned_embeddings):
-                distances.append(spatial.distance.cosine(sampled_vector, ith_vec_of_embeddings))
+                try:
+                    distances.append(spatial.distance.cosine(sampled_vector, ith_vec_of_embeddings))
+                except RuntimeWarning as r:
+                    print(r)
+                    continue
 
             distances = np.array(distances)
 
@@ -1756,6 +2104,22 @@ class DataAnalyser(object):
             list_of_clusters.append(d)
 
         return list_of_clusters
+
+    def new_cosine(self, learned_embeddings):
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        sims = cosine_similarity(learned_embeddings)
+
+        vocabulary_of_entity_names = list(learned_embeddings.index)
+
+        top_sims = np.argmax(sims, axis=0)
+
+        for index, name in enumerate(vocabulary_of_entity_names):
+            print('Target ', name)
+            print('Most sim', vocabulary_of_entity_names[top_sims[index]])
+
+            if index == 10:
+                break
 
     @staticmethod
     def calculate_euclidean_distance(*, embeddings, entitiy_to_P_URI, entitiy_to_N_URI):
@@ -1782,7 +2146,7 @@ class DataAnalyser(object):
         print('Distance comparision d(A)/d(R) ', total_distance_from_attractives / total_distance_from_repulsives)
 
     @performance_debugger('Sample from mean of clusters')
-    def sample_from_clusters(self, labeled_embeddings, num_sample_from_clusters):
+    def sample_from_mean_of_clusters(self, labeled_embeddings, num_sample_from_clusters):
         def calculate_difference_to_mean(data_point):
             euclidiean_dist = distance.euclidean(data_point, mean_of_cluster)
             return euclidiean_dist
@@ -1795,14 +2159,14 @@ class DataAnalyser(object):
             cluster = labeled_embeddings.loc[labeled_embeddings.labels == label].copy()
             mean_of_cluster = cluster.mean()
 
-            cluster['euclidean_distance_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
+            cluster['d_to_mean'] = cluster.apply(calculate_difference_to_mean, axis=1)
             # cluster.loc[:, 'description']
-            cluster.sort_values(by=['euclidean_distance_to_mean'], ascending=False)
+            cluster.sort_values(by=['d_to_mean'], ascending=False)
 
             sampled_entities_from_cluster = cluster.head(num_sample_from_clusters)
             sampled_total_entities = pd.concat([sampled_total_entities, sampled_entities_from_cluster])
 
-        sampled_total_entities.drop(['euclidean_distance_to_mean'], axis=1, inplace=True)
+        sampled_total_entities.drop(['d_to_mean'], axis=1, inplace=True)
 
         representative_entities = dict()
         for key, val in sampled_total_entities.labels.to_dict().items():
@@ -1810,39 +2174,183 @@ class DataAnalyser(object):
 
         return representative_entities
 
-    @performance_debugger('Pseudo labeling via DBSCAN')
-    def pseudo_label_DBSCAN(self, df):
-        df['labels'] = DBSCAN().fit(df).labels_
+    @performance_debugger('Sample from mean of clusters')
+    def sample_from_clusters(self, labeled_embeddings, num_sample_from_clusters):
+
+        labels = labeled_embeddings.labels.unique().tolist()
+
+        sampled_total_entities = pd.DataFrame()
+
+        for label in labels:
+            cluster = labeled_embeddings.loc[labeled_embeddings.labels == label]
+            if len(cluster) > num_sample_from_clusters:
+                sampled_entities_from_cluster = cluster.sample(n=num_sample_from_clusters)
+            else:
+                sampled_entities_from_cluster = cluster
+
+            sampled_total_entities = pd.concat([sampled_total_entities, sampled_entities_from_cluster])
+
+        representative_entities = dict()
+        for key, val in sampled_total_entities.labels.to_dict().items():
+            representative_entities.setdefault(val, set()).add(key)
+
+        return representative_entities
+
+    @performance_debugger('Pseudo labeling via HDBSCAN')
+    def pseudo_label_HDBSCAN(self, df,min_cluster_size=None,min_samples=None):
+
+#        projection = TSNE().fit_transform(df)
+
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size,min_samples=min_samples,algorithm='boruvka_kdtree').fit(df)
+        """
+        color_palette = sns.color_palette('deep',len(clusterer.labels_))
+
+
+        cluster_colors = [color_palette[x] if x >= 0
+                          else (0.5, 0.5, 0.5)
+                          for x in clusterer.labels_]
+
+        cluster_member_colors = [sns.desaturate(x, p) for x, p in
+                                 zip(cluster_colors, clusterer.probabilities_)]
+        plt.scatter(*projection.T, s=50, linewidth=0, c=cluster_member_colors, alpha=0.25)
+        plt.title('TSNE on HDBSCAN labelled Embeddings')
+
+        plt.savefig(self.p_folder+'/tsne_hdbscan_embeddings.png', format='png', dpi=1000)
+
+        
+        """
+
+        df['labels'] = clusterer.labels_
+
         return df
+
+
+    @performance_debugger('Pseudo labeling via DBSCAN')
+    def pseudo_label_DBSCAN(self, df,eps=None,min_samples=None):
+        df['labels'] = DBSCAN(eps=eps,min_samples=min_samples).fit(df).labels_
+        return df
+
+
+
+    @performance_debugger('Pseudo labeling via Kmeans')
+    def pseudo_label_Kmeans(self, df,n_clusters=2):
+        df['labels'] = MiniBatchKMeans(n_clusters).fit(df).labels_
+        return df
+
+
+    @performance_debugger('Clustering Quality Task')
+    def perform_clustering_quality(self, df, type_info=None):
+        """
+
+        :param df:
+        :param re_indexer:
+        :return:
+        """
+
+        if type_info==None:
+            type_info = ut.deserializer(path=self.p_folder, serialized_name='type_info')
+
+        df_only_subjects=df.iloc[list(type_info.keys())]
+
+
+        clusters = pd.unique(df_only_subjects.labels)
+
+
+        score=0
+        for c in clusters:
+            indexes_in_c = df_only_subjects[df_only_subjects.labels == c].index.values
+            print('##### CLUSTER', c, ' #####')
+
+            sum_of_cosines = 0
+
+            poss = [pos for pos, i in enumerate(indexes_in_c) if len(type_info[i]) > 0]
+            valid_indexes_in_c = indexes_in_c[poss]
+
+
+
+            if len(valid_indexes_in_c)==0:
+                continue
+
+
+            if len(valid_indexes_in_c)>100:
+                sampled_points=self.sample_from_mean_of_clusters(df_only_subjects[df_only_subjects.labels == c],100)
+                index_of_sampled_points=list(*sampled_points.values())
+
+                poss = [pos for pos, i in enumerate(index_of_sampled_points) if len(type_info[i]) > 0]
+                valid_indexes_in_c = indexes_in_c[poss]
+
+
+
+
+            for i in valid_indexes_in_c:
+
+                # returns a set of indexes
+                types_i=type_info[i]
+                len_types_i=len(types_i)
+
+                for j in valid_indexes_in_c:
+
+                    nom=len(types_i & type_info[j])
+                    denom=math.sqrt(len_types_i) * math.sqrt(len(type_info[j]))
+
+                    sum_of_cosines+=nom/denom
+
+
+            aritiy=sum_of_cosines/(len(valid_indexes_in_c)**2)
+
+            score+=aritiy
+            output='Size of the cluster_'+str(c)+':'+str(len(valid_indexes_in_c))+ '.Quality of cluster_'+str(c)+': '+str(aritiy)
+            print(output)
+            Saver.settings.append(output)
+
+            """
+            type_historgram=vocabulary[np.array(type_historgram)]
+            type_historgram=list(map(lambda x:x.rsplit('/')[-1],type_historgram))
+#            type_historgram=list(map(lambda x: x[x.index('#'):],type_historgram))
+            plt.title('Historgram of types in cluster_'+str(c)+'_score:'+str(aritiy))
+            plt.xticks(rotation=90)
+            plt.hist(type_historgram,bins=100)
+
+            plt.show()
+            """
+
+        mean_of_scores=score/len(clusters)
+        Saver.settings.append('Mean of purity scores: '+str(mean_of_scores))
+
+        return mean_of_scores
 
     @performance_debugger('Prune non resources')
     def prune_non_subject_entities(self, embeddings, upper_folder='not init'):
 
         if upper_folder != 'not init':
-            index_of_only_subjects = ut.deserializer(path=upper_folder, serialized_name="indexes_of_valid_subjects")
+            index_to_predicates = ut.deserializer(path=upper_folder, serialized_name="predicates_to_indexes")
         else:
-            index_of_only_subjects = ut.deserializer(path=self.p_folder, serialized_name="indexes_of_valid_subjects")
+            #           index_to_predicates = ut.deserializer(path='/home/demir/Desktop/work/DICE_pl2vec/Experiments/',
+            #                                                  serialized_name="index_to_prune_for_dl")
+            #          vocabulary = ut.deserializer(path='/home/demir/Desktop/work/DICE_pl2vec/Experiments/',
+            #                                      serialized_name="vocabulary")
+            index_to_predicates = ut.deserializer(path=self.p_folder, serialized_name="index_to_prune_for_dl")
+            vocabulary = ut.deserializer(path=self.p_folder, serialized_name="vocabulary")
 
-        # index_of_predicates = ut.deserializer(path=self.p_folder, serialized_name="index_of_predicates")
-
-        # Prune those subject that occurred in predicate position
-        # index_of_only_subjects = np.setdiff1d(index_of_resources, index_of_predicates)
-
-        # i_vocab = ut.deserializer(path=self.p_folder, serialized_name="i_vocab")
-
-        # names = np.array(list(i_vocab.values()))[index_of_only_subjects]
+        raw_predicates = list(index_to_predicates.values())
+        for i in raw_predicates:
+            if i in vocabulary:
+                del vocabulary[i]
 
         # PRUNE non subject entities
-        embeddings = embeddings[index_of_only_subjects]
-        del index_of_only_subjects
+        embeddings = embeddings[list(vocabulary.values())]
 
-        names = ut.deserializer(path=self.p_folder, serialized_name="subjects")
+        #       names=[re.findall('<(.+?)>', name)[0] for name in list(vocabulary.keys())]
 
-        embeddings = pd.DataFrame(embeddings, index=names)
-        del names
+        embeddings = pd.DataFrame(embeddings, index=list(vocabulary.keys()))
+
+        del vocabulary
+
+        # subembeddings = embeddings[~embeddings.index.str.match('http://dl-learner.org/carcinogenesis')]
 
         return embeddings
 
+    @performance_debugger('Embedding space partitioning')
     def apply_partitioning(self, X, partitions, samp_part):
 
         if len(X) < partitions:
@@ -1871,7 +2379,7 @@ class DataAnalyser(object):
         :param num_sample:
         :return:
         """
-        embeddings = self.sample_from_clusters(embeddings, num_of_sample)
+        embeddings = self.sample_from_mean_of_clusters(embeddings, num_of_sample)
         embeddings.drop(columns=['labels'], inplace=True)
         return embeddings
 
@@ -1882,13 +2390,10 @@ class DataAnalyser(object):
         embeddings_of_resources = self.prune_non_subject_entities(embeddings=E, upper_folder=path)
 
         # Partition total embeddings into number of 10
-        # E = self.apply_partitioning(embeddings_of_resources, partitions=20, samp_part=10)
+        E = self.apply_partitioning(embeddings_of_resources, partitions=20, samp_part=20)
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
-        print(pseudo_labelled_embeddings)
-
-        exit(1)
         ut.serializer(object_=self.p_folder, path=path,
                       serialized_name='pseudo_labelled_resources')
 
@@ -1896,7 +2401,7 @@ class DataAnalyser(object):
         Saver.settings.append(pseudo_labelled_embeddings.labels.value_counts().to_string())
         Saver.settings.append("#####")
 
-        sampled_embeddings = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
+        sampled_embeddings = self.sample_from_mean_of_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
 
         representative_entities = dict()
 
@@ -1910,46 +2415,50 @@ class DataAnalyser(object):
 
     @performance_debugger('Pipeline of DP')
     def pipeline_of_data_processing_single_run(self, E, num_sample_from_clusters):
-
         # prune predicates and literals
         embeddings_of_resources = self.prune_non_subject_entities(E)
 
         # Partition total embeddings into number of 10
-        # embeddings_of_resources = self.apply_partitioning(embeddings_of_resources, partitions=50, samp_part=10)
+        # embeddings_of_resources = self.apply_partitioning(embeddings_of_resources, partitions=50, samp_part=50)
 
         pseudo_labelled_embeddings = self.pseudo_label_DBSCAN(embeddings_of_resources)
 
-        self.topN_cosine(pseudo_labelled_embeddings, 5, 20)
+        # pseudo_labelled_embeddings = self.pseudo_label_Kmeans(embeddings_of_resources)
 
-        ut.serializer(object_=pseudo_labelled_embeddings, path=self.p_folder,
-                      serialized_name='pseudo_labelled_resources')
+        self.topN_cosine(pseudo_labelled_embeddings, 10, 10)
+
+        pseudo_labelled_embeddings.to_csv(self.p_folder + '/pseudo_labelled_embeddings.csv')
+
+        # ut.serializer(object_=pseudo_labelled_embeddings, path=self.p_folder,
+        #               serialized_name='pseudo_labelled_resources')
 
         Saver.settings.append("### cluster distribution##")
         Saver.settings.append(pseudo_labelled_embeddings.labels.value_counts().to_string())
         Saver.settings.append("##" * 20)
 
-        representative_entities = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
+        # representative_entities = self.sample_from_clusters(pseudo_labelled_embeddings, num_sample_from_clusters)
+
+        representative_entities = self.sample_from_mean_of_clusters(pseudo_labelled_embeddings,
+                                                                    num_sample_from_clusters)
 
         Saver.settings.append('Num of generated clusters: ' + str(len(list(representative_entities.keys()))))
 
-        f = open(self.p_folder + '/Settings', 'w')
-
-        for text in Saver.settings:
-            f.write(text)
-            f.write('\n')
-        f.close()
-
-        print(representative_entities)
-
         return representative_entities
 
-    def apply_tsne_and_plot_only_subjects(self, e):
+    def apply_tsne_and_plot_only_subjects(self, e, prune=False):
+        """
+        e should be V x 2 dataframe index must be names
+        :param e:
+        :param prune:
+        :return:
+        """
         import dash
         import dash_core_components as dcc
         import dash_html_components as html
         import plotly.graph_objs as go
 
-        e = self.prune_non_subject_entities(e)
+        if prune:
+            e = self.prune_non_subject_entities(e)
 
         external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 
@@ -1987,20 +2496,6 @@ class DataAnalyser(object):
         ])
 
         app.run_server(debug=True)
-
-    """
-    def modifier(self, item):
-        item = item.replace('>', '')
-        item = item.replace('<', '')
-        item = item.replace(' .', '')
-        item = item.replace('\n', '')
-        return item
-
-    def converter(self, item):
-        if isinstance(item, bytes):
-            item = item.decode("utf-8")
-        return item
-    """
 
     def create_config(self, config_path, pos_examples, sampled_neg):
 
@@ -2140,25 +2635,49 @@ class DataAnalyser(object):
 
     def execute_dl(self, sampled_representatives):
 
-        all_samples = np.array(list(sampled_representatives.values()))
-
         if len(sampled_representatives) == 1:
             print('Only one cluster found in the embedding space')
             print('Exitting.')
+            return None
+        try:
+
+            sum_lists = list(sampled_representatives.values())
+
+            all_samples = set()
+
+            for i in sum_lists:
+
+                for j in i:
+                    all_samples.add(j)
+
+        #           all_samples = set.union(*set(list(sampled_representatives.values())))
+        except TypeError as t:
+            print(t)
+            print(sampled_representatives)
+            print(sampled_representatives.values())
+            print(type(sampled_representatives.values()))
             exit(1)
 
-        for cluster_label, val in sampled_representatives.items():
-            positive_subjects = list(val)
+        for cluster_label, positive_subjects in sampled_representatives.items():
+            sampled_negatives = all_samples.difference(positive_subjects)
 
-            candidates_of_negative_subjects = np.setdiff1d(all_samples, positive_subjects)
-
-            sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects), replace=False)
-
+            """
+            
+            try:
+                sampled_negatives = np.random.choice(candidates_of_negative_subjects, len(positive_subjects),
+                                                     replace=False)
+            except ValueError as t:
+                print(t)
+                sampled_negatives = candidates_of_negative_subjects
+            """
             self.create_config(self.p_folder + '/' + str(cluster_label), positive_subjects, sampled_negatives)
 
     @performance_debugger('DL-Learner')
     def pipeline_of_dl_learner(self, path, dict_of_cluster_with_original_term_names):
 
+        print(dict_of_cluster_with_original_term_names)
+
+        exit(1)
         with open(path + "/subjects_to_indexes.p", "rb") as f:
             str_subjects = list(pickle.load(f).keys())
 
@@ -2172,18 +2691,7 @@ class DataAnalyser(object):
     @performance_debugger('DL-Learner')
     def pipeline_of_single_evaluation_dl_learner(self, dict_of_cluster_with_original_term_names):
 
-        # vocab.p is mapping from string to pos
-        # str_subjects = list(pickle.load(open(path + "/subjects_to_indexes.p", "rb")).keys())
-
-        #        str_subjects = list(ut.deserializer(path=self.p_folder, serialized_name='subjects').keys())
-
-        # for key, val in dict_of_cluster_with_original_term_names.items():
-        #    dict_of_cluster_with_original_term_names[key] = [str_subjects[item] for item in val]
-
-        self.kg_path = self.p_folder
-
         self.execute_dl(dict_of_cluster_with_original_term_names)
-        # self.execute_DL(resources=str_subjects, dict_of_cluster=dict_of_cluster_with_original_term_names)
 
 
 class Saver:

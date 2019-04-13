@@ -9,7 +9,6 @@ dl_learner_path = 'dllearner-1.3.0/bin/cli'
 analyser = DataAnalyser(execute_DL_Learner=dl_learner_path)
 analyser.generated_responds(folder_path=p)
 
-# collect reponses
-#analyser.collect_data(p)
-
-#analyser.combine_all_data(p)
+analyser.collect_data(p)
+exit(1)
+analyser.combine_all_data(p)

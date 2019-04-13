@@ -8,14 +8,15 @@ PL2VEC is an open source project for knowledge graph embedding.
     - [PL2VEC](#PL2VEC)
     - [Data Analyser](#data-analyser)
 - [Installation](#installation)
-- [Interactive playground](#playground)
+- [Interactive playground](#Playground)
 
 
 
 ## PL2VEC
 PL2VEC is a novel physical embedding model for RDF knowledge graphs. 
-It is a physical model as its properties are inherited from disciplines:  
-Hooke's Law and Coulomb's Law from ***Physics***,
+It is a physical model as two of its properties are inherited from Physics, i.e., Hooke's Law and Coulomb's Law. Briefly,
+
+
 an optimization technique inspired by Simulated Annealing and several similarity measurements pointwise mutual information and entropy weighted jaccard similarity.
 . For more information please refer to URL of paper.
 
@@ -71,7 +72,7 @@ Python 3.6.4
 git clone https://github.com/Demirrr/physical_embedding.git
 pip install -r requirements.txt
 ```
-## Interactive playground
+## Playground
 
 We provide an interactive playground of PL2VEC via Google Colab. Users can easly reproduce our evaluations as well as 
 observe easy usage of our framework.

@@ -13,9 +13,12 @@ from sklearn.decomposition import TruncatedSVD
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from bz2 import BZ2File
+import bz2
 
 
-def get_path_knowledge_graphs(self, path: str):
+
+def get_path_knowledge_graphs(path: str):
     """
 
     :param path: str represents path of a KB or path of folder containg KBs
@@ -35,6 +38,15 @@ def get_path_knowledge_graphs(self, path: str):
         print(path + ' is not a path for a file or a folder containing any .nq or .nt formatted files')
         exit(1)
     return KGs
+
+
+def file_type(f_name):
+    if f_name[-4:] == '.bz2':
+        reader = bz2.open(f_name, "rt")
+        return reader
+    return open(f_name, "r")
+
+
 
 def initialize_with_svd(stats_corpus_info: Dict, embeddings_dim):
     """
@@ -158,39 +170,6 @@ def visualize_2D(low_embeddings, storage_path, title='default name'):
     plt.show()
 
 
-def calculate_similarities(context_of_a, context_of_b, entropies):
-
-    intersection = snp.intersect(context_of_a, context_of_b)
-
-    if len(intersection) == 0:
-        return 0
-
-    sum_of_ent_context_of_a= entropies[context_of_a].sum()
-
-    sum_of_ent_context_of_b = entropies[context_of_b].sum()
-
-    sum_of_ent_intersections = entropies[intersection].sum()
-
-    sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
-
-    return sim
-
-
-def cal_demir(context_of_a, context_of_b, entropies):
-    intersection = snp.intersect(context_of_a, context_of_b)
-
-    sum_of_ent_context_of_a = entropies[context_of_a].sum()
-
-    sum_of_ent_context_of_b = entropies[context_of_b].sum()
-
-    sum_of_ent_intersections = entropies[intersection].sum()
-
-    sim = sum_of_ent_intersections / (sum_of_ent_context_of_a + sum_of_ent_context_of_b)
-
-    return sim
-
-
-
 
 def apply_pca(X):
     pca = PCA(n_components=2)
@@ -200,7 +179,7 @@ def apply_pca(X):
 
 
 
-def decompose_rdf(self, sentence):
+def decompose_rdf(sentence):
 
     flag=0
     # if self.is_literal_in_rdf(sentence):
@@ -248,15 +227,61 @@ def decompose_rdf(self, sentence):
         raise ValueError()
 
 
-    #o = re.sub("\s+", "", o)
-
-    #s = re.sub("\s+", "", s)
-
-    #p = re.sub("\s+", "", p)
-
     return s, p, o,flag
 
-
-
 def randomly_initialize_embedding_space(num_vocab, embeddings_dim):
-    return np.random.rand(num_vocab, embeddings_dim).astype(np.float64) + 1
+    return np.random.rand(num_vocab, embeddings_dim)
+
+
+def write_settings(path,settings):
+    f = open(path + '/Settings', 'w')
+    for text in settings:
+        f.write(text)
+        f.write('\n')
+    f.close()
+
+
+
+def read_kb_for_w2v():
+    path='KGs/Mutag/mutag_rdf_car.nt'
+
+    reader = open(path, "r")
+
+    required_formated=list()
+    for rdf_triple in reader:
+        required_formated.extend(rdf_triple.split())
+
+    reader.close()
+    return required_formated
+
+
+def generator_of_reader(bound,knowledge_graphs,rdf_decomposer,vocab=None):
+    for f_name in knowledge_graphs:
+        reader = file_type(f_name)
+        total_sentence = 0
+        for sentence in reader:
+
+            #Ignore Literals
+            if '"' in sentence or "'" in sentence:
+                continue
+
+            if total_sentence == bound: break
+            total_sentence += 1
+
+            try:
+                s, p, o, flag = rdf_decomposer(sentence)
+
+                # <..> <..> <..>
+                if flag !=4:
+                    print(sentence, '+', flag)
+                    continue
+
+            except ValueError as v:
+                ## started 2017-03-31T16:36:17Z
+#                print(sentence)
+                continue
+
+            yield s, p, o
+
+
+        reader.close()
