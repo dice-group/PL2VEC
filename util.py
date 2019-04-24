@@ -243,15 +243,14 @@ def write_settings(path,settings):
 
 
 def read_kb_for_w2v():
-    path='KGs/Mutag/mutag_rdf_car.nt'
-
-    reader = open(path, "r")
-
+    path='/home/demir/Desktop/complex/datasets/drugbank/train.txt'
     required_formated=list()
-    for rdf_triple in reader:
-        required_formated.extend(rdf_triple.split())
 
-    reader.close()
+    with open(path, "r") as reader:
+        for rdf_triple in reader:
+            s,p,o,_=rdf_triple.split()
+            required_formated.extend((s,p,o))
+
     return required_formated
 
 

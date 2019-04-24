@@ -9,8 +9,6 @@ from helper_classes import Saver
 import util as ut
 
 # Define Paths
-#kg_root = 'KGs/DBpedia_2016_10_core'
-#kg_path = kg_root + '/'
 
 kg_root = 'KGs/Drugbank'
 kg_path = kg_root + '/drugbank.nq'
@@ -31,11 +29,11 @@ problem = {
               'negative_constant',
               'HDBSCAN_min_cluster_size',
               'HDBSCAN_min_sample'],
-    'bounds': [[1, 50],
+    'bounds': [[20, 200],
                [0.0001, 0.9],
                [-10, -0.5],
-               [2, 50],
-               [2, 100]]
+               [10, 50],
+               [10, 100]]
 }
 
 
@@ -46,14 +44,16 @@ np.random.seed(random_state)
 current_param_folder, experiment_folder = ut.create_experiment_folder()
 
 # Generate samples
-sobol_sampled_parameters = pd.DataFrame(saltelli.sample(problem, 20), columns=['K',
+sobol_sampled_parameters = pd.DataFrame(saltelli.sample(problem, 3), columns=['K',
                                                                               'energy_release_at_epoch',
                                                                               'negative_constant',
                                                                               'HDBSCAN_min_cluster_size',
                                                                               'HDBSCAN_min_sample'
                                                                                ])
 
+print(len(sobol_sampled_parameters))
 
+exit(1)
 sobol_sampled_parameters['K'] = sobol_sampled_parameters.K.astype(np.uint32)
 sobol_sampled_parameters['negative_constant'] = np.around(sobol_sampled_parameters.negative_constant,5)
 sobol_sampled_parameters['energy_release_at_epoch'] = np.around(sobol_sampled_parameters.energy_release_at_epoch,5)
@@ -61,8 +61,6 @@ sobol_sampled_parameters['HDBSCAN_min_cluster_size'] = sobol_sampled_parameters.
 sobol_sampled_parameters['HDBSCAN_min_sample'] = sobol_sampled_parameters.HDBSCAN_min_sample.astype(np.uint32)
 
 
-print(len(sobol_sampled_parameters))
-exit(1)
 sobol_sampled_parameters.sort_values(by=['K'],inplace=True)
 
 
@@ -77,7 +75,7 @@ analyser = DataAnalyser(execute_DL_Learner=dl_learner_path, p_folder=experiment_
 parser.set_similarity_measure(PPMI)
 
 # Read KG as we do not need to read KG for each individual sampled input parameter
-num_of_rdf=parser.process_KB_w_Sobol(kg_path, bound=50_000)
+num_of_rdf=parser.process_KB_w_Sobol(kg_path, bound=5_000)
 
 old_K=None
 for parameters in sobol_sampled_parameters.itertuples():
@@ -125,9 +123,7 @@ for parameters in sobol_sampled_parameters.itertuples():
 
     del embeddings
 
-#    df = analyser.pseudo_label_DBSCAN(pd.DataFrame(learned_embeddings), eps=DBSCAN_eps, min_samples=DBSCAN_min_sample)
     df = analyser.pseudo_label_HDBSCAN(pd.DataFrame(learned_embeddings), min_cluster_size=HDBSCAN_min_cluster_size, min_samples=HDBSCAN_min_sample)
-    #df = analyser.pseudo_label_Kmeans(pd.DataFrame(learned_embeddings), n_clusters=len(learned_embeddings) // 10)
 
     del learned_embeddings
 
@@ -136,6 +132,3 @@ for parameters in sobol_sampled_parameters.itertuples():
 
     ut.write_settings(storage_path,Saver.settings)
     Saver.settings.clear()
-
-
-    break

@@ -8,7 +8,8 @@ from collections import Counter, defaultdict
 import itertools
 from scipy import spatial
 from sklearn.cluster import DBSCAN, MiniBatchKMeans
-from sklearn.manifold import TSNE
+from scipy.spatial.distance import cosine
+from sklearn.neighbors.kd_tree import KDTree
 
 import util as ut
 import os.path
@@ -21,15 +22,13 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
-from typing import Tuple
 import typing
-from scipy import sparse
 import warnings
 import sortednp as snp
 import sys
 from abc import ABC, abstractmethod
 import hdbscan
-import seaborn as sns
+from itertools import chain
 
 print('Do not forget warnigngs')
 warnings.filterwarnings('ignore')
@@ -42,7 +41,7 @@ def performance_debugger(func_name):
         def debug(*args, **kwargs):
             long_string = ''
             starT = time.time()
-            print('\n######', func_name, ' starts ######')
+            print('\n\n######', func_name, ' starts ######')
             r = func(*args, **kwargs)
             print(func_name, ' took ', time.time() - starT, ' seconds\n')
             long_string += str(func_name) + ' took:' + str(time.time() - starT) + ' seconds'
@@ -60,7 +59,7 @@ class SimilarityCalculator(ABC):
         self._num_triples = None
 
     @abstractmethod
-    def get_similarities(self, inverted_index, num_triples,top_K):
+    def get_similarities(self, inverted_index, num_triples, top_K):
         pass
 
 
@@ -83,11 +82,10 @@ class PPMI(SimilarityCalculator):
             marginal_probs[unq_ent] = probability
         self._marginal_probs = marginal_probs
 
-
     @performance_debugger('Calculation of PPMIs')
     def calculate_ppmi(self) -> np.array:
 
-        holder=list()
+        holder = list()
 
         for unq_ent, list_of_context_ent in enumerate(self.inverted_index):
             top_k_sim = dict()
@@ -95,7 +93,6 @@ class PPMI(SimilarityCalculator):
             marginal_prob_of_target = self._marginal_probs[unq_ent]
 
             statistical_info_of_cooccurrences = Counter(list_of_context_ent)
-
 
             top_k_sim.setdefault(unq_ent, dict())
 
@@ -109,7 +106,7 @@ class PPMI(SimilarityCalculator):
 
                 PMI_val = np.log2(joint_prob) - np.log2(denominator)
 
-                if PMI_val<=0:
+                if PMI_val <= 0:
                     continue
 
                 if len(top_k_sim[unq_ent]) <= self._topK:
@@ -121,25 +118,21 @@ class PPMI(SimilarityCalculator):
                             del top_k_sim[unq_ent][k]
                             break
 
-
-
             context = np.array(list(top_k_sim[unq_ent].keys()), dtype=np.uint32)
             sims = np.array(list(top_k_sim[unq_ent].values()), dtype=np.float32)
             sims.shape = (sims.size, 1)
 
             # sampled may contain dublicated variables
-            sampled = np.random.choice(len(self.inverted_index), self._topK*2)
+            sampled = np.random.choice(len(self.inverted_index), self._topK)
 
             # negatives must be disjoint from context of k.th vocabulary term and k.term itsel
             negatives = np.setdiff1d(sampled, np.append(context, unq_ent), assume_unique=True)
 
             holder.append((context, sims, negatives))
 
-
-
         return holder
 
-    def get_similarities(self, inverted_index, num_triples,top_K):
+    def get_similarities(self, inverted_index, num_triples, top_K):
         """
 
         :param inverted_index:
@@ -154,7 +147,7 @@ class PPMI(SimilarityCalculator):
         """
         self.inverted_index = inverted_index
         self._num_triples = num_triples
-        self._topK=top_K
+        self._topK = top_K
         self.calculate_marginal_probabilities()
 
         similarities = self.calculate_ppmi()
@@ -171,8 +164,8 @@ class WeightedJaccard(SimilarityCalculator):
         self._num_triples = None
         self.p_folder = p_folder
 
-        self._lowerbound=0.09
-        self._upperbound=0.3#0.3
+        self._lowerbound = 0.09
+        self._upperbound = 0.3  # 0.3
 
     def calculate_entropies(self):
         entropies = list()
@@ -207,6 +200,7 @@ class WeightedJaccard(SimilarityCalculator):
         :param results:
         :return:
         """
+
         def calculate_sim(subjects):
             """
             Inverted_index contains each unique subject predicate and object.
@@ -228,9 +222,8 @@ class WeightedJaccard(SimilarityCalculator):
                 similarities.setdefault(re_indexer[i], dict())
 
                 for j in subjects:
-                    if i==j:
+                    if i == j:
                         continue
-
 
                     re_indexer.setdefault(j, len(re_indexer))
                     context_j = self._inverted_index[j]
@@ -240,9 +233,9 @@ class WeightedJaccard(SimilarityCalculator):
 
                     sum_ent_intersection = self._entropies[intersection].sum()
 
-                    sim = 2*sum_ent_intersection / (sum_ent_context_i + sum_ent_context_j)
+                    sim = 2 * sum_ent_intersection / (sum_ent_context_i + sum_ent_context_j)
 
-                    #print(vocabulary[i],'',vocabulary[j],'=',sim)
+                    # print(vocabulary[i],'',vocabulary[j],'=',sim)
                     if sim > 0:
                         similarities.setdefault(re_indexer[j], dict())
 
@@ -252,8 +245,7 @@ class WeightedJaccard(SimilarityCalculator):
         similarities = dict()
         re_indexer = dict()
 
-        #vocabulary = np.array(ut.deserializer(path=self.p_folder, serialized_name='vocabulary'))
-
+        # vocabulary = np.array(ut.deserializer(path=self.p_folder, serialized_name='vocabulary'))
 
         seen = set()
         for groups in results:
@@ -304,7 +296,6 @@ class WeightedJaccard(SimilarityCalculator):
                 if result:
                     yield result
 
-
         def get_intersections(context_p, context_l_o):
 
             subjects = list()
@@ -337,9 +328,9 @@ class WeightedJaccard(SimilarityCalculator):
 
         similarities = self.calculate_weighted_jaccard(self.prune_pairs_of_p_o())
 
-        similarities= np.array(list(similarities.values()))
+        similarities = np.array(list(similarities.values()))
 
-        print('|subjects|',len(similarities))
+        print('|subjects|', len(similarities))
 
         return similarities
 
@@ -691,7 +682,6 @@ class Parser:
     
     """
 
-
     def get_path_knowledge_graphs(self, path: str):
         """
 
@@ -705,7 +695,6 @@ class Parser:
         else:
             for root, dir, files in os.walk(path):
                 for file in files:
-                    # print(file)
                     if '.nq' in file or '.nt' in file or 'ttl' in file:
                         KGs.append(path + '/' + file)
         if len(KGs) == 0:
@@ -728,7 +717,6 @@ class Parser:
         elif len(components) == 4:
             del components[-1]
             s, p, o = components
-
 
             flag = 4
 
@@ -905,7 +893,6 @@ class Parser:
 
         return return_val
 
-
     def apply_ppmi_on_entitiy_adj_matrix(self, freq_adj_matrix: typing.Dict[int, Counter], num_triples: int) -> \
             typing.Tuple[dict, dict]:
         """
@@ -975,7 +962,6 @@ class Parser:
         :return:
         """
 
-
         holder = list()
 
         for k, v in enumerate(similarities):
@@ -1012,10 +998,7 @@ class Parser:
             similarities = self.similarity_measurer(similar_characteristics, self.p_folder).get_similarities(
                 inverted_index, num_of_rdf)
         else:
-            holder = self.similarity_measurer().get_similarities(inverted_index, num_of_rdf,self.K)
-
-
-#        holder = self.get_attractive_repulsive_entities(similarities)
+            holder = self.similarity_measurer().get_similarities(inverted_index, num_of_rdf, self.K)
 
         return holder
 
@@ -1024,7 +1007,7 @@ class Parser:
 
         inverted_index, num_of_rdf, _ = self.inverted_index(f_name, bound)
 
-        ut.serializer(object_=inverted_index,path=self.p_folder,serialized_name='inverted_index')
+        ut.serializer(object_=inverted_index, path=self.p_folder, serialized_name='inverted_index')
 
         return num_of_rdf
 
@@ -1320,8 +1303,8 @@ class Parser:
         for s, p, o in sentences:
 
             num_of_rdf += 1
-#            writer_kb.write(s + ' ' + p + ' ' + o + ' .\n')
-            writer_kb.write(s + ' ' + p + ' ' + o + ' .\n')
+            #            writer_kb.write(s + ' ' + p + ' ' + o + ' .\n')
+            writer_kb.write('<'+s + '> <' + p + '> <' + o + '> .\n')
 
             # mapping from string to vocabulary
             vocabulary.setdefault(s, len(vocabulary))
@@ -1335,7 +1318,6 @@ class Parser:
             if 'rdf-syntax-ns#type' in p:
                 type_info[vocabulary[s]].add(vocabulary[o])
 
-
         print('Number of RDF triples:', num_of_rdf)
         print('Number of vocabulary terms: ', len(vocabulary))
         print('Number of subjects: ', len(type_info))
@@ -1344,7 +1326,7 @@ class Parser:
         Saver.settings.append('Number of subjects:' + str(len(type_info)))
         Saver.settings.append('Number of vocabulary terms: ' + str(len(vocabulary)))
 
-        #writer_kb.close()
+        # writer_kb.close()
         # This command ensures that inverted index starts from 0 to the size of vocabulary.
         # If this always true, we do not need to store key values.
         assert list(inverted_index.keys()) == list(range(0, len(vocabulary)))
@@ -1361,9 +1343,8 @@ class Parser:
         ut.serializer(object_=type_info, path=self.p_folder, serialized_name='type_info')
         del type_info
 
-        print('Exitting')
-        exit(1)
         return inverted_index, num_of_rdf, similar_characteristics
+
 
 class PL2VEC(object):
     def __init__(self, system_energy=1):
@@ -1396,7 +1377,7 @@ class PL2VEC(object):
         dist = embedding_space[repulsive_indexes] - embedding_space[target_index]
 
         # replace all zeros to 1
-        dist[dist == 0] = 1
+        dist[dist == 0] = 0.1
         with warnings.catch_warnings():
             try:
                 #                r_square = dist ** 2
@@ -1404,7 +1385,7 @@ class PL2VEC(object):
 
                 total_push = negative_constant * np.reciprocal(dist).sum(axis=0)
                 # replace all zeros to 1
-                total_push[total_push == 0] = 1
+                total_push[total_push == 0] = 0.1
 
 
             except RuntimeWarning as r:
@@ -1479,7 +1460,7 @@ class PL2VEC(object):
             if self.equilibrium(epoch, previous_f_norm, new_f_norm, d_ratio):
                 break
 
-        return e
+        return pd.DataFrame(e)
 
     def equilibrium(self, epoch, p_n, n_n, d_ratio):
 
@@ -2197,48 +2178,21 @@ class DataAnalyser(object):
         return representative_entities
 
     @performance_debugger('Pseudo labeling via HDBSCAN')
-    def pseudo_label_HDBSCAN(self, df,min_cluster_size=None,min_samples=None):
-
-#        projection = TSNE().fit_transform(df)
-
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size,min_samples=min_samples,algorithm='boruvka_kdtree').fit(df)
-        """
-        color_palette = sns.color_palette('deep',len(clusterer.labels_))
-
-
-        cluster_colors = [color_palette[x] if x >= 0
-                          else (0.5, 0.5, 0.5)
-                          for x in clusterer.labels_]
-
-        cluster_member_colors = [sns.desaturate(x, p) for x, p in
-                                 zip(cluster_colors, clusterer.probabilities_)]
-        plt.scatter(*projection.T, s=50, linewidth=0, c=cluster_member_colors, alpha=0.25)
-        plt.title('TSNE on HDBSCAN labelled Embeddings')
-
-        plt.savefig(self.p_folder+'/tsne_hdbscan_embeddings.png', format='png', dpi=1000)
-
-        
-        """
-
+    def pseudo_label_HDBSCAN(self, df, min_cluster_size=None, min_samples=None):
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples).fit(df)
         df['labels'] = clusterer.labels_
-
         return df
-
 
     @performance_debugger('Pseudo labeling via DBSCAN')
-    def pseudo_label_DBSCAN(self, df,eps=None,min_samples=None):
-        df['labels'] = DBSCAN(eps=eps,min_samples=min_samples).fit(df).labels_
+    def pseudo_label_DBSCAN(self, df, eps=None, min_samples=None):
+        df['labels'] = DBSCAN(eps=eps, min_samples=min_samples).fit(df).labels_
         return df
 
-
-
     @performance_debugger('Pseudo labeling via Kmeans')
-    def pseudo_label_Kmeans(self, df,n_clusters=2):
+    def pseudo_label_Kmeans(self, df, n_clusters=2):
         df['labels'] = MiniBatchKMeans(n_clusters).fit(df).labels_
         return df
 
-
-    @performance_debugger('Clustering Quality Task')
     def perform_clustering_quality(self, df, type_info=None):
         """
 
@@ -2247,60 +2201,55 @@ class DataAnalyser(object):
         :return:
         """
 
-        if type_info==None:
+        if type_info == None:
             type_info = ut.deserializer(path=self.p_folder, serialized_name='type_info')
 
-        df_only_subjects=df.iloc[list(type_info.keys())]
+        df_only_subjects = df.loc[list(type_info.keys())]
 
-
+        print(len(df_only_subjects))
         clusters = pd.unique(df_only_subjects.labels)
 
-
-        score=0
+        score = 0
         for c in clusters:
-            indexes_in_c = df_only_subjects[df_only_subjects.labels == c].index.values
-            print('##### CLUSTER', c, ' #####')
-
-            sum_of_cosines = 0
-
-            poss = [pos for pos, i in enumerate(indexes_in_c) if len(type_info[i]) > 0]
-            valid_indexes_in_c = indexes_in_c[poss]
-
-
-
-            if len(valid_indexes_in_c)==0:
+            if c == -1:
+                'indicates noise'
                 continue
 
+            indexes_in_c = df_only_subjects[df_only_subjects.labels == c].index.values
 
-            if len(valid_indexes_in_c)>100:
-                sampled_points=self.sample_from_mean_of_clusters(df_only_subjects[df_only_subjects.labels == c],100)
-                index_of_sampled_points=list(*sampled_points.values())
+            sum_of_cosines = 0
+            valid_indexes_in_c = indexes_in_c
+
+            if len(valid_indexes_in_c) == 1:
+                continue
+            print('##### CLUSTER', c, ' #####')
+
+            if len(valid_indexes_in_c) > 1000:
+                sampled_points = self.sample_from_mean_of_clusters(df_only_subjects[df_only_subjects.labels == c], 1000)
+                index_of_sampled_points = list(*sampled_points.values())
 
                 poss = [pos for pos, i in enumerate(index_of_sampled_points) if len(type_info[i]) > 0]
                 valid_indexes_in_c = indexes_in_c[poss]
 
-
-
-
             for i in valid_indexes_in_c:
 
                 # returns a set of indexes
-                types_i=type_info[i]
-                len_types_i=len(types_i)
+                types_i = type_info[i]
+                len_types_i = len(types_i)
 
                 for j in valid_indexes_in_c:
+                    nom = len(types_i & type_info[j])
+                    denom = math.sqrt(len_types_i) * math.sqrt(len(type_info[j]))
 
-                    nom=len(types_i & type_info[j])
-                    denom=math.sqrt(len_types_i) * math.sqrt(len(type_info[j]))
+                    sum_of_cosines += nom / denom
 
-                    sum_of_cosines+=nom/denom
+            aritiy = sum_of_cosines / (len(valid_indexes_in_c) ** 2)
 
-
-            aritiy=sum_of_cosines/(len(valid_indexes_in_c)**2)
-
-            score+=aritiy
-            output='Size of the cluster_'+str(c)+':'+str(len(valid_indexes_in_c))+ '.Quality of cluster_'+str(c)+': '+str(aritiy)
+            score += aritiy
+            output = 'Size of the cluster(' + str(c) + ')=' + str(
+                len(valid_indexes_in_c)) + '\t Cluster Quality=' + str(aritiy)
             print(output)
+
             Saver.settings.append(output)
 
             """
@@ -2314,10 +2263,93 @@ class DataAnalyser(object):
             plt.show()
             """
 
-        mean_of_scores=score/len(clusters)
-        Saver.settings.append('Mean of purity scores: '+str(mean_of_scores))
+        mean_of_scores = score / len(clusters)
+        print('\nMean of cluster quality', mean_of_scores)
+        Saver.settings.append('Mean of cluster quality: ' + str(mean_of_scores))
 
         return mean_of_scores
+
+    def perform_type_prediction(self, df):
+
+        def get_similarities(e:pd.DataFrame):
+            """
+
+            :param e:
+            :return:
+            """
+            kdt = KDTree(e, metric='euclidean')
+            _ = kdt.query(e, k=101, return_distance=False)
+            s=pd.DataFrame(_)
+            
+            s.to_csv(self.p_folder + '/Similarities_pyke_50.csv')
+
+            #vocabulary = ut.deserializer(path=self.p_folder, serialized_name='vocabulary')
+            #l = s.applymap(lambda x: vocabulary[x])
+            #l.to_csv(self.p_folder + '/mapped_most_sims.csv')
+
+            # reindex the similarity results
+            mapper = dict(zip(list(range(len(s))), e.index.values))
+            s = s.applymap(lambda x: mapper[x])
+
+            return s
+
+
+        # get the types. Mapping from the index of subject to the index of object
+        type_info = ut.deserializer(path=self.p_folder, serialized_name='type_info')
+
+        # get the index of objects / get type information =>>> s #type o
+        all_types = sorted(set.union(*list(type_info.values())))
+
+        # Consider only points with type infos.
+        e_w_types = df.loc[list(type_info.keys())]
+
+        # get most similar 100 points
+        df_most_similars=get_similarities(e_w_types)
+
+        k_values = [1, 3, 5, 10, 15, 30, 50, 100]
+
+
+        e = ThreadPoolExecutor(20)
+
+        def create_binary_type_vector(t_types,a_types):
+            vector = np.zeros(len(all_types))
+            i = [a_types.index(_) for _ in t_types]
+            vector[i] = 1
+            return vector
+
+        def create_binary_type_prediction_vector(t_types,a_types):
+            vector = np.zeros(len(all_types))
+            i = [a_types.index(_) for _ in chain.from_iterable(t_types)]
+            vector[i] += 1
+            return vector
+
+
+
+
+        for k in k_values:
+            print('#####', k, '####')
+            similarities = list()
+            for _, S in df_most_similars.iterrows():
+
+                true_types = type_info[S.values[0]]
+                type_predictions = [type_info[_] for _ in S.values[1:k + 1]]
+
+
+                f_target = e.submit(create_binary_type_vector, true_types, all_types)
+                f_pre = e.submit(create_binary_type_prediction_vector, type_predictions, all_types)
+
+                vector_true=f_target.result()
+                vector_prediction=f_pre.result()
+
+
+                sim = cosine(vector_true, vector_prediction)
+                similarities.append(1 - sim)
+
+
+            report = pd.DataFrame(similarities)
+            print('Mean type prediction', report.mean().values)
+            #            print(report.describe())
+            report.to_csv(self.p_folder + '/TypePrediction_' + str(k) + '_PYKE_50__cosine.csv')
 
     @performance_debugger('Prune non resources')
     def prune_non_subject_entities(self, embeddings, upper_folder='not init'):
