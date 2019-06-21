@@ -1,4 +1,4 @@
-### Physical Embedding Model for Knowledge Graphs ###
+### PL2Vec ###
 
 PL2VEC is an open source project for knowledge graph embedding.
 
@@ -12,9 +12,8 @@ PL2VEC is an open source project for knowledge graph embedding.
 
 
 
-## PL2VEC
-PL2VEC is a novel physical embedding model for RDF knowledge graphs. 
-It is a physical model as its properties are inherited from disciplines:  
+## PL2VEC 
+PL2Vec is a physical model as its properties are inherited from disciplines:  
 Hooke's Law and Coulomb's Law from ***Physics***,
 an optimization technique inspired by Simulated Annealing and several similarity measurements pointwise mutual information and entropy weighted jaccard similarity.
 . For more information please refer to URL of paper.
